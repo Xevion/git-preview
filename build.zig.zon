@@ -56,6 +56,10 @@
             .url = "https://github.com/libgit2/libgit2/archive/refs/tags/v1.9.7.tar.gz",
             .hash = "N-V-__8AAPE7NgGzXiYp17A2YYEYpVRbRzgNqovmU-BWmr8z",
         },
+        .gemoji = .{
+            .url = "https://github.com/github/gemoji/archive/refs/tags/v4.1.0.tar.gz",
+            .hash = "N-V-__8AAHLaDwA6r_qFRpDGVHX7kTSrJDf2CDsNZR7sYHcV",
+        },
     },
     .paths = .{
         "build.zig",

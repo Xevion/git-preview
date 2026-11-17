@@ -2,3 +2,4 @@
 #include <lexbor/html/serialize.h>
 #include <lexbor/dom/interfaces/element.h>
 #include <lexbor/dom/interfaces/character_data.h>
+#include <lexbor/dom/interfaces/text.h>

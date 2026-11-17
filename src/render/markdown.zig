@@ -79,7 +79,7 @@ fn isHex(s: []const u8) bool {
 test "matches GitHub's recorded output for each fixture" {
     const gpa = std.testing.allocator;
     const io = std.testing.io;
-    const fixtures = [_][]const u8{ "basics", "blocks", "alerts" };
+    const fixtures = [_][]const u8{ "basics", "blocks", "alerts", "emoji" };
     for (fixtures) |name| {
         const md_path = try std.fmt.allocPrint(gpa, "tests/markdown/{s}.md", .{name});
         defer gpa.free(md_path);

@@ -1,6 +1,7 @@
 const std = @import("std");
 const cmark = @import("build/cmark.zig");
 const lexbor = @import("build/lexbor.zig");
+const emoji = @import("build/emoji.zig");
 const libgit2 = @import("build/libgit2.zig");
 
 pub fn build(b: *std.Build) void {
@@ -19,6 +20,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.addImport("LetterCasing", zg.module("LetterCasing"));
     exe_mod.addImport("GeneralCategories", zg.module("GeneralCategories"));
     addAssets(b, exe_mod);
+    emoji.addTo(b, exe_mod);
 
     const exe = b.addExecutable(.{
         .name = "git-preview",

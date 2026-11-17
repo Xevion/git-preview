@@ -45,3 +45,7 @@ lexbor-sources:
         find core dom encoding html ns tag -name '*.c' | sort | sed 's/.*/    "&",/'
         echo '};'
     } > "{{justfile_directory()}}/build/lexbor_sources.zig"
+
+# Refresh GitHub's custom (non-Unicode) emoji names from its emoji API.
+custom-emoji:
+    gh api /emojis --jq 'to_entries[] | select(.value | contains("/unicode/") | not) | .key' | sort > data/custom-emoji.txt

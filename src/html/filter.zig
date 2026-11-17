@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const c = @import("lexbor");
+const emoji = @import("emoji.zig");
 const Node = c.lxb_dom_node_t;
 const Element = c.lxb_dom_element_t;
 
@@ -118,8 +119,9 @@ pub fn finalize(gpa: std.mem.Allocator, fragment: []const u8, options: Options) 
     const ctx = c.lxb_dom_document_create_element(&doc.*.dom_document, "body", 4, null) orelse return error.OutOfMemory;
     const root: *Node = c.lxb_html_document_parse_fragment(doc, ctx, fragment.ptr, fragment.len) orelse return error.HtmlParse;
 
-    var f: Filter = .{ .doc = &doc.*.dom_document, .opts = options };
+    var f: Filter = .{ .gpa = gpa, .doc = &doc.*.dom_document, .opts = options };
     try f.sanitize(root);
+    try f.emojify(root);
     try f.linkImages(root);
 
     var out: std.ArrayList(u8) = .empty;
@@ -135,6 +137,7 @@ pub fn finalize(gpa: std.mem.Allocator, fragment: []const u8, options: Options) 
 }
 
 const Filter = struct {
+    gpa: std.mem.Allocator,
     doc: *c.lxb_dom_document_t,
     opts: Options,
     in_raw: bool = false,
@@ -207,6 +210,70 @@ const Filter = struct {
         }
         if (is_img) setAttr(el, "style", "max-width: 100%;");
         if (inList(&dir_auto_tags, name) and !hasAttr(el, "dir")) setAttr(el, "dir", "auto");
+    }
+
+    /// Replaces `:shortcode:` emoji in text, skipping code, as GitHub's emoji filter does.
+    fn emojify(f: *Filter, parent: *Node) !void {
+        var cur: ?*Node = parent.first_child;
+        while (cur) |node| {
+            cur = node.next;
+            switch (node.type) {
+                c.LXB_DOM_NODE_TYPE_ELEMENT => {
+                    const name = localName(node);
+                    if (!(std.mem.eql(u8, name, "pre") or std.mem.eql(u8, name, "code") or std.mem.eql(u8, name, "tt"))) try f.emojify(node);
+                },
+                c.LXB_DOM_NODE_TYPE_TEXT => try f.emojifyText(node),
+                else => {},
+            }
+        }
+    }
+
+    fn emojifyText(f: *Filter, node: *Node) !void {
+        const data: *c.lxb_dom_character_data_t = @ptrCast(node);
+        const text = data.data.data[0..data.data.length];
+        var m = emoji.next(text, 0) orelse return;
+        var pending_start: usize = 0;
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(f.gpa);
+        while (true) {
+            try buf.appendSlice(f.gpa, text[pending_start..m.start]);
+            switch (m.emoji) {
+                .unicode => |u| try buf.appendSlice(f.gpa, u),
+                .custom => |name| {
+                    try f.insertText(node, buf.items);
+                    buf.clearRetainingCapacity();
+                    try f.insertCustomEmoji(node, name);
+                },
+            }
+            pending_start = m.end;
+            m = emoji.next(text, m.end) orelse break;
+        }
+        try buf.appendSlice(f.gpa, text[pending_start..]);
+        try f.insertText(node, buf.items);
+        remove(node);
+    }
+
+    fn insertText(f: *Filter, before: *Node, text: []const u8) !void {
+        if (text.len == 0) return;
+        const t: *Node = @ptrCast(c.lxb_dom_document_create_text_node(f.doc, text.ptr, text.len) orelse return error.OutOfMemory);
+        c.lxb_dom_node_insert_before(before, t);
+    }
+
+    fn insertCustomEmoji(f: *Filter, before: *Node, name: []const u8) !void {
+        const img: *Node = @ptrCast(c.lxb_dom_document_create_element(f.doc, "img", 3, null) orelse return error.OutOfMemory);
+        const el: *Element = @ptrCast(img);
+        var title_buf: [128]u8 = undefined;
+        const title = try std.fmt.bufPrint(&title_buf, ":{s}:", .{name});
+        var src_buf: [256]u8 = undefined;
+        const src = try std.fmt.bufPrint(&src_buf, "https://github.githubassets.com/images/icons/emoji/{s}.png", .{name});
+        setAttr(el, "class", "emoji");
+        setAttr(el, "title", title);
+        setAttr(el, "alt", title);
+        setAttr(el, "src", src);
+        setAttr(el, "height", "20");
+        setAttr(el, "width", "20");
+        setAttr(el, "align", "absmiddle");
+        c.lxb_dom_node_insert_before(before, img);
     }
 
     /// Wraps every image outside a link in a link to itself, as GitHub does; emoji images are exempt.
