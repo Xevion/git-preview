@@ -49,3 +49,15 @@ lexbor-sources:
 # Refresh GitHub's custom (non-Unicode) emoji names from its emoji API.
 custom-emoji:
     gh api /emojis --jq 'to_entries[] | select(.value | contains("/unicode/") | not) | .key' | sort > data/custom-emoji.txt
+
+# Regenerate the relative-time golden table from GitHub's relative-time-element, run under bun.
+relative-time-golden:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir=$(mktemp -d)
+    for f in duration duration-format-ponyfill intl-cache; do
+        curl -sSfL "https://unpkg.com/@github/relative-time-element@5.3.1/dist/$f.js" -o "$dir/$f.js"
+    done
+    cp tests/time/gen.mjs "$dir/"
+    TZ=America/Chicago bun "$dir/gen.mjs" > tests/time/relative-chicago.txt
+    rm -r "$dir"
