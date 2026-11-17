@@ -18,23 +18,43 @@ const site = "https://github.com";
 pub const Page = struct {
     gpa: std.mem.Allocator,
     doc: *c.lxb_html_document_t,
-    /// Raw HTML spliced in at serialization, keyed by the marker comment's text.
+    /// Raw HTML spliced in at serialization, keyed by the marker comment's text; both owned.
     splices: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
     /// The inlined stylesheets, kept alive because `classes` points into them.
     css: std.ArrayList([]u8) = .empty,
     classes: Classes = .{},
+    /// The page as fetched, scripts included; its embedded JSON holds data the DOM only has as skeletons.
+    source: []const u8 = "",
 
     pub fn deinit(self: *Page) void {
         _ = c.lxb_html_document_destroy(self.doc);
+        for (self.splices.keys(), self.splices.values()) |k, v| {
+            self.gpa.free(k);
+            self.gpa.free(v);
+        }
         self.splices.deinit(self.gpa);
         self.classes.deinit(self.gpa);
         for (self.css.items) |s| self.gpa.free(s);
         self.css.deinit(self.gpa);
+        self.gpa.free(self.source);
     }
 
     /// A hashed class from its stem, falling back to `fallback` (stable utility classes) when unresolvable.
     pub fn class(self: *const Page, stem: []const u8, fallback: []const u8) []const u8 {
-        return self.classes.resolve(stem) orelse fallback;
+        return self.classes.resolve(stem) orelse {
+            log.debug("class stem {s} unresolved, using \"{s}\"", .{ stem, fallback });
+            return fallback;
+        };
+    }
+
+    /// For stems several components share: the candidate from the CSS module that `sibling` (a stem
+    /// unique to the intended component) belongs to.
+    pub fn classNear(self: *const Page, stem: []const u8, sibling: []const u8, fallback: []const u8) []const u8 {
+        const anchor = self.classes.resolve(sibling) orelse {
+            log.debug("class stem {s} unresolved, using \"{s}\"", .{ sibling, fallback });
+            return fallback;
+        };
+        return self.classes.resolveNear(stem, anchor) orelse fallback;
     }
 
     pub fn root(self: *Page) *Node {
@@ -42,19 +62,27 @@ pub const Page = struct {
     }
 
     /// Replaces `target`'s children with `html`, which is trusted and inserted verbatim.
-    pub fn setInnerHtml(self: *Page, target: *Node, key: []const u8, html: []const u8) !void {
+    pub fn setInnerHtml(self: *Page, target: *Node, html: []const u8) !void {
         while (@as(?*Node, target.first_child)) |child| dom.remove(child);
-        const marker = c.lxb_dom_document_create_comment(&self.doc.*.dom_document, key.ptr, key.len) orelse return error.OutOfMemory;
-        c.lxb_dom_node_insert_child(target, @ptrCast(marker));
-        try self.splices.put(self.gpa, key, html);
+        c.lxb_dom_node_insert_child(target, try self.marker(html));
     }
 
     /// Replaces `target` itself with `html`, which is trusted and inserted verbatim.
-    pub fn replaceWith(self: *Page, target: *Node, key: []const u8, html: []const u8) !void {
-        const marker = c.lxb_dom_document_create_comment(&self.doc.*.dom_document, key.ptr, key.len) orelse return error.OutOfMemory;
-        c.lxb_dom_node_insert_before(target, @ptrCast(marker));
+    pub fn replaceWith(self: *Page, target: *Node, html: []const u8) !void {
+        c.lxb_dom_node_insert_before(target, try self.marker(html));
         dom.remove(target);
-        try self.splices.put(self.gpa, key, html);
+    }
+
+    /// A comment node that serialization swaps for `html`.
+    fn marker(self: *Page, html: []const u8) !*Node {
+        try self.splices.ensureUnusedCapacity(self.gpa, 1);
+        const key = try std.fmt.allocPrint(self.gpa, "gp-{d}", .{self.splices.count()});
+        errdefer self.gpa.free(key);
+        const value = try self.gpa.dupe(u8, html);
+        errdefer self.gpa.free(value);
+        const node = c.lxb_dom_document_create_comment(&self.doc.*.dom_document, key.ptr, key.len) orelse return error.OutOfMemory;
+        self.splices.putAssumeCapacity(key, value);
+        return @ptrCast(node);
     }
 
     pub fn serialize(self: *Page, gpa: std.mem.Allocator) ![]u8 {
@@ -96,7 +124,8 @@ pub fn parse(gpa: std.mem.Allocator, fetcher: *Fetcher, html: []const u8) !Page 
     errdefer _ = c.lxb_html_document_destroy(doc);
     if (c.lxb_html_document_parse(doc, html.ptr, html.len) != c.LXB_STATUS_OK) return error.HtmlParse;
 
-    var page: Page = .{ .gpa = gpa, .doc = doc };
+    var page: Page = .{ .gpa = gpa, .doc = doc, .source = try gpa.dupe(u8, html) };
+    errdefer gpa.free(page.source);
     var prep: Prep = .{ .gpa = gpa, .fetcher = fetcher, .doc = doc, .page = &page };
     defer prep.seen.deinit(gpa);
     try dom.eachElement(page.root(), &prep, Prep.visit);
@@ -116,6 +145,8 @@ const Prep = struct {
         const el: *Element = @ptrCast(node);
         if (std.mem.eql(u8, name, "script") or std.mem.eql(u8, name, "noscript")) return dom.remove(node);
         if (std.mem.eql(u8, name, "link")) return self.link(node, el);
+        // Server-rendered controls stay disabled until hydration, which never comes.
+        dom.removeAttr(el, "aria-disabled");
         inline for (.{ "href", "src", "action", "poster" }) |attr| {
             if (dom.getAttr(el, attr)) |v| {
                 if (std.mem.startsWith(u8, v, "/") and !std.mem.startsWith(u8, v, "//")) {

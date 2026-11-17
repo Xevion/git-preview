@@ -12,6 +12,16 @@ pub const file_directory_fill = body("file-directory-fill");
 pub const file = body("file");
 pub const file_submodule = body("file-submodule");
 pub const file_symlink_file = body("file-symlink-file");
+pub const tag = body("tag");
+pub const release = body("release");
+pub const heart = body("heart");
+pub const check = body("check");
+pub const x = body("x");
+pub const dot_fill = body("dot-fill");
+pub const question = body("question");
+pub const person = body("person");
+pub const ellipsis = body("ellipsis");
+pub const git_pull_request = body("git-pull-request");
 
 /// The SVG's inner markup, with self-closing elements expanded the way GitHub serializes them.
 fn body(comptime name: []const u8) []const u8 {

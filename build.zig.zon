@@ -37,8 +37,8 @@
             .hash = "N-V-__8AACaGFwDmjLKFjd0jlhijuVlTuOCGoRVvp406CsLD",
         },
         .octicons = .{
-            .url = "https://github.com/primer/octicons/archive/refs/tags/v19.33.0.tar.gz",
-            .hash = "N-V-__8AAC8VFACt6qSEtF6qCAlbHzfb2jXr_7qCmCgnRsxl",
+            .url = "https://github.com/primer/octicons/archive/68ec2de8d0ddfcbb7497da01d0b7d98eb5593020.tar.gz",
+            .hash = "N-V-__8AAAl2FgDl7Ib2JJFJn-kOpxr6AQbCaWOFwlJNFmNv",
         },
         .github_markdown_css = .{
             .url = "https://github.com/sindresorhus/github-markdown-css/archive/refs/tags/v5.9.0.tar.gz",

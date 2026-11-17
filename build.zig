@@ -49,8 +49,10 @@ pub fn build(b: *std.Build) void {
 
 /// Octicons the renderer emits; each is reachable as `@embedFile("octicon/<name>")`.
 const octicon_names = [_][]const u8{
-    "link",                "info", "light-bulb",     "report",            "alert", "stop",
-    "file-directory-fill", "file", "file-submodule", "file-symlink-file",
+    "link",                "info",             "light-bulb",     "report",            "alert",    "stop",
+    "file-directory-fill", "file",             "file-submodule", "file-symlink-file", "tag",      "release",
+    "heart",               "check",            "x",              "dot-fill",          "question", "person",
+    "ellipsis",            "git-pull-request",
 };
 
 /// Exposes pinned upstream assets to `@embedFile`, so updating one is a `zig fetch --save` of a newer tag.

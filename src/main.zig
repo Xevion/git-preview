@@ -8,9 +8,22 @@ const source_mod = @import("source.zig");
 const Source = source_mod.Source;
 const Resolver = @import("urls.zig").Resolver;
 const Fetcher = @import("net/Fetcher.zig");
+const github = @import("net/github.zig");
 const template = @import("chrome/template.zig");
 const home = @import("chrome/home.zig");
+const sidebar = @import("chrome/sidebar.zig");
+const gather = @import("chrome/gather.zig");
 const Zone = @import("chrome/Zone.zig");
+
+pub const std_options: std.Options = .{ .log_level = .debug, .logFn = logFn };
+
+/// Debug lines (network traffic, skipped sections) only with `--verbose`.
+var verbose = false;
+
+fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+    if (level == .debug and !verbose) return;
+    std.log.defaultLog(level, scope, format, args);
+}
 
 const params = clap.parseParamsComptime(
     \\-h, --help            Show this help and exit.
@@ -22,6 +35,7 @@ const params = clap.parseParamsComptime(
     \\    --open            Open the page in the default browser.
     \\    --readme-only     Write only the rendered README instead of the full repository page.
     \\    --offline         Never use the network; render from cached pages and data only.
+    \\-v, --verbose         Log network requests and other details to stderr.
     \\<str>                 File to render (default: the README the forge would show).
     \\
 );
@@ -45,6 +59,7 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer res.deinit();
 
+    verbose = res.args.verbose != 0;
     if (res.args.version != 0) {
         var out_buf: [64]u8 = undefined;
         var out: std.Io.File.Writer = .init(.stdout(), io, &out_buf);
@@ -156,7 +171,8 @@ fn run(
     const full_page = args.@"readme-only" == 0 and file_abs == null and kind == .github and remote != null;
     const html = blk: {
         if (full_page) {
-            if (repoPage(arena, io, env, &fetcher, &repo, args.rev, head_oid, remote.?, fragment)) |p| break :blk p else |err| {
+            const ctx: PageContext = .{ .arena = arena, .io = io, .env = env, .fetcher = &fetcher, .repo = &repo, .rev = args.rev, .remote_name = args.remote };
+            if (repoPage(ctx, head_oid, remote.?, fragment)) |p| break :blk p else |err| {
                 try stderr.print("git-preview: repository page unavailable ({s}), writing the README alone\n", .{@errorName(err)});
             }
         }
@@ -177,40 +193,41 @@ fn run(
     if (args.open != 0) try openInBrowser(io, out_path);
 }
 
+const PageContext = struct {
+    arena: std.mem.Allocator,
+    io: std.Io,
+    env: *std.process.Environ.Map,
+    fetcher: *Fetcher,
+    repo: *const Repo,
+    rev: ?[]const u8,
+    remote_name: ?[]const u8,
+};
+
 /// The repo home page from github.com with our README swapped into its README box.
-fn repoPage(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, fetcher: *Fetcher, repo: *const Repo, rev: ?[]const u8, head: ?Repo.Oid, remote: forge.Remote, readme: []const u8) ![]u8 {
+fn repoPage(ctx: PageContext, head: ?Repo.Oid, remote: forge.Remote, readme: []const u8) ![]u8 {
+    const arena = ctx.arena;
     const url = try std.fmt.allocPrint(arena, "https://{s}/{s}", .{ remote.host, remote.path });
-    var tpl = try template.load(arena, fetcher, url);
+    var tpl = try template.load(arena, ctx.fetcher, url);
     defer tpl.deinit();
     const article = template.readmeArticle(&tpl) orelse return error.TemplateWithoutReadme;
-    try tpl.setInnerHtml(article, "gp-readme", readme);
-    if (head) |oid| try home.fill(arena, &tpl, try homeData(arena, io, env, repo, rev, oid, remote));
-    return tpl.serialize(arena);
-}
+    try tpl.setInnerHtml(article, readme);
 
-fn homeData(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, repo: *const Repo, rev: ?[]const u8, oid: Repo.Oid, remote: forge.Remote) !home.Data {
-    var hex: [Repo.Oid.max_hex_len]u8 = undefined;
-    const ref = rev orelse try repo.headBranch(arena, io) orelse try arena.dupe(u8, oid.hex(&hex)[0..7]);
-    const tree = try repo.listTree(arena, io, oid, "");
-    const commits = try repo.lastCommits(arena, io, oid, "");
-    const entries = try arena.alloc(home.Entry, tree.len);
-    for (tree, entries) |t, *e| {
-        const found = for (commits) |pc| {
-            if (std.mem.eql(u8, pc.name, t.name)) break pc.commit;
-        } else return error.MissingLastCommit;
-        e.* = .{ .name = t.name, .kind = t.kind, .commit = found };
+    const zone = Zone.load(arena, ctx.io, ctx.env);
+    const now = std.Io.Clock.real.now(ctx.io).toSeconds();
+    const web: github.Web = .{ .fetcher = ctx.fetcher, .arena = arena, .repo_path = remote.path };
+    var api: github.Api = .{ .fetcher = ctx.fetcher, .env = ctx.env };
+    if (head) |oid| {
+        const data = try gather.homeData(arena, ctx.io, .{
+            .repo = ctx.repo,
+            .oid = oid,
+            .rev = ctx.rev,
+            .remote_name = ctx.remote_name,
+            .repo_path = remote.path,
+        }, &web, &api, &zone, now);
+        try home.fill(arena, &tpl, data);
     }
-    const zone = try arena.create(Zone);
-    zone.* = Zone.load(arena, io, env);
-    return .{
-        .repo_path = remote.path,
-        .ref = ref,
-        .commit_count = try repo.commitCount(arena, io, oid),
-        .head = try repo.commitInfo(arena, io, oid),
-        .entries = entries,
-        .now = std.Io.Clock.real.now(io).toSeconds(),
-        .zone = zone,
-    };
+    try sidebar.fill(arena, &tpl, .{ .sidebar = web.sidebar().get(), .now = now, .zone = &zone });
+    return tpl.serialize(arena);
 }
 
 /// Forge URL prefix for repo files at the rendered commit; relative links point there.
@@ -263,5 +280,12 @@ test {
     _ = @import("chrome/home.zig");
     _ = @import("chrome/time.zig");
     _ = @import("chrome/Classes.zig");
+    _ = @import("chrome/Zone.zig");
+    _ = @import("chrome/civil.zig");
+    _ = @import("chrome/markup.zig");
+    _ = @import("chrome/sidebar.zig");
+    _ = @import("chrome/gather.zig");
+    _ = @import("net/github.zig");
+    _ = @import("net/credentials.zig");
     _ = @import("highlight/highlight.zig");
 }
