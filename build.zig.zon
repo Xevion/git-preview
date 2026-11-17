@@ -36,6 +36,14 @@
             .url = "https://github.com/github/cmark-gfm/archive/refs/tags/0.29.0.gfm.13.tar.gz",
             .hash = "N-V-__8AACaGFwDmjLKFjd0jlhijuVlTuOCGoRVvp406CsLD",
         },
+        .octicons = .{
+            .url = "https://github.com/primer/octicons/archive/refs/tags/v19.33.0.tar.gz",
+            .hash = "N-V-__8AAC8VFACt6qSEtF6qCAlbHzfb2jXr_7qCmCgnRsxl",
+        },
+        .github_markdown_css = .{
+            .url = "https://github.com/sindresorhus/github-markdown-css/archive/refs/tags/v5.9.0.tar.gz",
+            .hash = "N-V-__8AAOqSAwAIjxK2FU5uCwJLTngg_C7R9gr2v5CGpVh-",
+        },
     },
     .paths = .{
         "build.zig",

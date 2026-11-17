@@ -203,20 +203,20 @@ const Renderer = struct {
         try r.out("</a></div>\n");
     }
 
-    fn octicon(r: *Renderer, class: []const u8, path: []const u8) !void {
-        try r.print("<svg data-component=\"Octicon\" class=\"octicon {s}\" viewBox=\"0 0 16 16\" version=\"1.1\" width=\"16\" height=\"16\" aria-hidden=\"true\"><path d=\"", .{class});
-        try r.out(path);
-        try r.out("\"></path></svg>");
+    fn octicon(r: *Renderer, class: []const u8, body: []const u8) !void {
+        try r.print("<svg data-component=\"Octicon\" class=\"octicon {s}\" viewBox=\"0 0 16 16\" version=\"1.1\" width=\"16\" height=\"16\" aria-hidden=\"true\">", .{class});
+        try r.out(body);
+        try r.out("</svg>");
     }
 
-    const Alert = struct { class: []const u8, title: []const u8, icon: []const u8, path: []const u8 };
+    const Alert = struct { class: []const u8, title: []const u8, icon: []const u8, svg: []const u8 };
 
     const alerts = [_]Alert{
-        .{ .class = "note", .title = "Note", .icon = "octicon-info mr-2", .path = octicons.info },
-        .{ .class = "tip", .title = "Tip", .icon = "octicon-light-bulb mr-2", .path = octicons.light_bulb },
-        .{ .class = "important", .title = "Important", .icon = "octicon-report mr-2", .path = octicons.report },
-        .{ .class = "warning", .title = "Warning", .icon = "octicon-alert mr-2", .path = octicons.alert },
-        .{ .class = "caution", .title = "Caution", .icon = "octicon-stop mr-2", .path = octicons.stop },
+        .{ .class = "note", .title = "Note", .icon = "octicon-info mr-2", .svg = octicons.info },
+        .{ .class = "tip", .title = "Tip", .icon = "octicon-light-bulb mr-2", .svg = octicons.light_bulb },
+        .{ .class = "important", .title = "Important", .icon = "octicon-report mr-2", .svg = octicons.report },
+        .{ .class = "warning", .title = "Warning", .icon = "octicon-alert mr-2", .svg = octicons.alert },
+        .{ .class = "caution", .title = "Caution", .icon = "octicon-stop mr-2", .svg = octicons.stop },
     };
 
     /// Detects `[!TYPE]` alone on a blockquote's first line, followed by more content.
@@ -250,7 +250,7 @@ const Renderer = struct {
             return;
         };
         try r.print("<div class=\"markdown-alert markdown-alert-{s}\" dir=\"auto\"><p class=\"markdown-alert-title\" dir=\"auto\">", .{found.alert.class});
-        try r.octicon(found.alert.icon, found.alert.path);
+        try r.octicon(found.alert.icon, found.alert.svg);
         try r.print("{s}</p>", .{found.alert.title});
         r.at_line_start = true;
         const para = c.cmark_node_first_child(n).?;

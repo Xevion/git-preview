@@ -15,6 +15,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     exe_mod.linkLibrary(cmark.lib);
+    addAssets(b, exe_mod);
 
     const exe = b.addExecutable(.{
         .name = "git-preview",
@@ -33,6 +34,24 @@ pub fn build(b: *std.Build) void {
     // Type-checks without emitting a binary, for fast feedback.
     const check_exe = b.addExecutable(.{ .name = "git-preview", .root_module = exe_mod });
     b.step("check", "Type-check without installing").dependOn(&check_exe.step);
+}
+
+/// Octicons the renderer emits; each is reachable as `@embedFile("octicon/<name>")`.
+const octicon_names = [_][]const u8{ "link", "info", "light-bulb", "report", "alert", "stop" };
+
+/// Exposes pinned upstream assets to `@embedFile`, so updating one is a `zig fetch --save` of a newer tag.
+fn addAssets(b: *std.Build, mod: *std.Build.Module) void {
+    const octicons = b.dependency("octicons", .{});
+    for (octicon_names) |name| {
+        mod.addAnonymousImport(b.fmt("octicon/{s}", .{name}), .{
+            .root_source_file = octicons.path(b.fmt("icons/{s}-16.svg", .{name})),
+        });
+    }
+    mod.addAnonymousImport("octicons.LICENSE", .{ .root_source_file = octicons.path("LICENSE") });
+
+    const css = b.dependency("github_markdown_css", .{});
+    mod.addAnonymousImport("github-markdown.css", .{ .root_source_file = css.path("github-markdown.css") });
+    mod.addAnonymousImport("github-markdown-css.LICENSE", .{ .root_source_file = css.path("license") });
 }
 
 const Cmark = struct {
