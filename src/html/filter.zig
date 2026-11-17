@@ -5,6 +5,13 @@
 const std = @import("std");
 const c = @import("lexbor");
 const emoji = @import("emoji.zig");
+const dom = @import("dom.zig");
+const localName = dom.localName;
+const getAttr = dom.getAttr;
+const hasAttr = dom.hasAttr;
+const setAttr = dom.setAttr;
+const remove = dom.remove;
+const unwrap = dom.unwrap;
 const Node = c.lxb_dom_node_t;
 const Element = c.lxb_dom_element_t;
 
@@ -305,40 +312,6 @@ const Filter = struct {
         }
     }
 };
-
-fn localName(node: *Node) []const u8 {
-    var len: usize = 0;
-    const p = c.lxb_dom_element_local_name(@ptrCast(node), &len);
-    return p[0..len];
-}
-
-fn getAttr(el: *Element, name: []const u8) ?[]const u8 {
-    var len: usize = 0;
-    const p = c.lxb_dom_element_get_attribute(el, name.ptr, name.len, &len) orelse return null;
-    return p[0..len];
-}
-
-fn hasAttr(el: *Element, name: []const u8) bool {
-    return c.lxb_dom_element_has_attribute(el, name.ptr, name.len);
-}
-
-fn setAttr(el: *Element, name: []const u8, value: []const u8) void {
-    _ = c.lxb_dom_element_set_attribute(el, name.ptr, name.len, value.ptr, value.len);
-}
-
-fn remove(node: *Node) void {
-    c.lxb_dom_node_remove(node);
-    _ = c.lxb_dom_node_destroy_deep(node);
-}
-
-/// Replaces an element with its children.
-fn unwrap(node: *Node) void {
-    while (@as(?*Node, node.first_child)) |child| {
-        c.lxb_dom_node_remove(child);
-        c.lxb_dom_node_insert_before(node, child);
-    }
-    remove(node);
-}
 
 fn finalizeRaw(raw: []const u8) ![]u8 {
     const gpa = std.testing.allocator;
