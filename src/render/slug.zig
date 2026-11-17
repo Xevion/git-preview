@@ -1,4 +1,6 @@
 const std = @import("std");
+const LetterCasing = @import("LetterCasing");
+const GeneralCategories = @import("GeneralCategories");
 
 /// Produces GitHub-style heading slugs, deduplicating repeats with `-N` suffixes per document.
 pub const Slugger = struct {
@@ -42,43 +44,31 @@ pub const Slugger = struct {
 
 /// Lowercases, keeps word characters, hyphens and spaces, then turns spaces into hyphens.
 pub fn slugify(gpa: std.mem.Allocator, text: []const u8) ![]u8 {
+    const lower = LetterCasing.toLowerAlloc(gpa, text) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer gpa.free(lower);
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
-    var view = std.unicode.Utf8View.init(text) catch return gpa.dupe(u8, text);
+    var view = std.unicode.Utf8View.init(lower) catch return gpa.dupe(u8, lower);
     var it = view.iterator();
-    while (it.nextCodepoint()) |cp| {
+    while (it.nextCodepointSlice()) |bytes| {
+        const cp = std.unicode.utf8Decode(bytes) catch continue;
         if (cp == ' ') {
             try out.append(gpa, '-');
-        } else if (cp == '-' or cp == '_' or isWord(cp)) {
-            var buf: [4]u8 = undefined;
-            const n = std.unicode.utf8Encode(toLower(cp), &buf) catch continue;
-            try out.appendSlice(gpa, buf[0..n]);
+        } else if (cp == '-' or isWord(cp)) {
+            try out.appendSlice(gpa, bytes);
         }
     }
     return out.toOwnedSlice(gpa);
 }
 
-/// Approximates Unicode \p{Word}: ASCII alphanumerics, plus non-ASCII outside the punctuation, symbol and emoji blocks.
+/// Onigmo's \p{Word}, which GitHub's Ruby slugger uses: letters, marks, decimal digits, connectors, joiners.
 fn isWord(cp: u21) bool {
-    if (cp < 0x80) return std.ascii.isAlphanumeric(@intCast(cp));
-    return switch (cp) {
-        0xA0...0xBF, 0xD7, 0xF7 => false,
-        0x2000...0x2BFF => false,
-        0x3000...0x303F => false,
-        0xFE00...0xFE0F => false,
-        0x1F000...0x1FAFF => false,
-        else => true,
-    };
-}
-
-/// Lowercases ASCII, Latin-1, Latin Extended-A, Greek and Cyrillic; other scripts pass through.
-fn toLower(cp: u21) u21 {
-    return switch (cp) {
-        'A'...'Z', 0xC0...0xD6, 0xD8...0xDE, 0x391...0x3A1, 0x3A3...0x3AB, 0x410...0x42F => cp + 0x20,
-        0x400...0x40F => cp + 0x50,
-        0x100...0x137, 0x14A...0x177 => if (cp % 2 == 0) cp + 1 else cp,
-        0x139...0x148, 0x179...0x17E => if (cp % 2 == 1) cp + 1 else cp,
-        else => cp,
+    if (cp == 0x200C or cp == 0x200D) return true;
+    return switch (GeneralCategories.gc(cp)) {
+        .Lu, .Ll, .Lt, .Lm, .Lo, .Nl, .Mn, .Mc, .Me, .Nd, .Pc => true,
+        else => false,
     };
 }
 
@@ -89,6 +79,8 @@ test "slugify matches GitHub for punctuation and unicode" {
         .{ "code & Em \u{2014} \u{dc}n\u{ef}code!", "code--em--\u{fc}n\u{ef}code" },
         .{ "snake_case-and.dots", "snake_case-anddots" },
         .{ "\u{1f680} Launch", "-launch" },
+        .{ "\u{3a9}MEGA \u{39a}\u{3b1}\u{3c3}\u{39f}\u{3a3}", "\u{3c9}mega-\u{3ba}\u{3b1}\u{3c3}\u{3bf}\u{3c2}" },
+        .{ "\u{4e2d}\u{6587} x\u{b2}", "\u{4e2d}\u{6587}-x" },
     };
     for (cases) |case| {
         const got = try slugify(gpa, case[0]);

@@ -44,6 +44,10 @@
             .url = "https://github.com/sindresorhus/github-markdown-css/archive/refs/tags/v5.9.0.tar.gz",
             .hash = "N-V-__8AAOqSAwAIjxK2FU5uCwJLTngg_C7R9gr2v5CGpVh-",
         },
+        .zg = .{
+            .url = "https://codeberg.org/atman/zg/archive/v0.18.0.tar.gz",
+            .hash = "zg-0.18.0-oGqU3MjboAJAkIdf1n_G20BmpEZs_f30RMCacLPVlTXU",
+        },
     },
     .paths = .{
         "build.zig",

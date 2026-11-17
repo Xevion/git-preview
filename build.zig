@@ -15,6 +15,9 @@ pub fn build(b: *std.Build) void {
         },
     });
     exe_mod.linkLibrary(cmark.lib);
+    const zg = b.dependency("zg", .{ .target = target, .optimize = optimize });
+    exe_mod.addImport("LetterCasing", zg.module("LetterCasing"));
+    exe_mod.addImport("GeneralCategories", zg.module("GeneralCategories"));
     addAssets(b, exe_mod);
 
     const exe = b.addExecutable(.{
