@@ -3,6 +3,7 @@ const cmark = @import("build/cmark.zig");
 const lexbor = @import("build/lexbor.zig");
 const emoji = @import("build/emoji.zig");
 const libgit2 = @import("build/libgit2.zig");
+const treesitter = @import("build/treesitter.zig");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -16,6 +17,7 @@ pub fn build(b: *std.Build) void {
     cmark.build(b, target, optimize).addTo(exe_mod, "cmark");
     lexbor.build(b, target, optimize).addTo(exe_mod, "lexbor");
     libgit2.build(b, target, optimize).addTo(exe_mod, "git2");
+    treesitter.build(b, target, optimize).addTo(exe_mod);
     const zg = b.dependency("zg", .{ .target = target, .optimize = optimize });
     exe_mod.addImport("LetterCasing", zg.module("LetterCasing"));
     exe_mod.addImport("GeneralCategories", zg.module("GeneralCategories"));

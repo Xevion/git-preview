@@ -192,4 +192,5 @@ test {
     _ = @import("forge.zig");
     _ = @import("source.zig");
     _ = @import("urls.zig");
+    _ = @import("highlight/highlight.zig");
 }

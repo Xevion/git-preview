@@ -3,6 +3,7 @@
 const std = @import("std");
 const c = @import("cmark");
 const octicons = @import("octicons.zig");
+const highlight = @import("../highlight/highlight.zig");
 const filter = @import("../html/filter.zig");
 const Slugger = @import("slug.zig").Slugger;
 const Writer = std.Io.Writer;
@@ -310,6 +311,7 @@ const Renderer = struct {
         const lang_end = std.mem.indexOfAny(u8, info, " \t") orelse info.len;
         const lang = info[0..lang_end];
         const code = literal(n);
+        if (highlight.scope(lang)) |scope| return r.highlightedBlock(lang, scope, code);
         if (r.opts.view == .readme) {
             try r.out("<div class=\"snippet-clipboard-content notranslate position-relative overflow-auto\" data-snippet-clipboard-copy-content=\"");
             try r.attr(std.mem.trimEnd(u8, code, "\n"));
@@ -325,6 +327,18 @@ const Renderer = struct {
         try r.out(r.codeOpen());
         try r.text(code);
         try r.out(if (r.opts.view == .readme) "</code></pre></div>\n" else "</code></pre>\n");
+    }
+
+    fn highlightedBlock(r: *Renderer, lang: []const u8, scope: []const u8, code: []const u8) !void {
+        if (r.opts.view == .readme) {
+            try r.print("<div class=\"highlight highlight-{s} notranslate position-relative overflow-auto\" dir=\"auto\" data-snippet-clipboard-copy-content=\"", .{scope});
+            try r.attr(std.mem.trimEnd(u8, code, "\n"));
+            try r.out("\"><pre>");
+        } else {
+            try r.print("<div class=\"highlight highlight-{s}\" dir=\"auto\"><pre class=\"notranslate\">", .{scope});
+        }
+        try highlight.writeSpans(r.gpa, lang, code, r.w);
+        try r.out("</pre></div>\n");
     }
 
     fn codeOpen(r: *Renderer) []const u8 {
