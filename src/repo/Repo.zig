@@ -342,6 +342,218 @@ pub fn listTree(self: *const Repo, gpa: Allocator, io: Io, commit: Oid, dir_path
     return list.toOwnedSlice(gpa);
 }
 
+/// Returns the short name of the branch HEAD points to, or null when HEAD is detached.
+/// An unborn branch still yields its name.
+pub fn headBranch(self: *const Repo, gpa: Allocator, io: Io) Error!?[]u8 {
+    _ = io;
+    var ref: ?*c.git_reference = null;
+    try check(c.git_reference_lookup(&ref, self.handle, "HEAD"), error.GitFailure);
+    defer c.git_reference_free(ref);
+    const target = c.git_reference_symbolic_target(ref) orelse return null;
+    const full = std.mem.span(target);
+    const prefix = "refs/heads/";
+    if (!std.mem.startsWith(u8, full, prefix)) return null;
+    return try gpa.dupe(u8, full[prefix.len..]);
+}
+
+pub const Commit = struct {
+    oid: Oid,
+    /// First line of the message.
+    summary: []u8,
+    author_name: []u8,
+    author_email: []u8,
+    /// Unix seconds.
+    author_time: i64,
+};
+
+pub fn freeCommit(gpa: Allocator, commit: Commit) void {
+    gpa.free(commit.summary);
+    gpa.free(commit.author_name);
+    gpa.free(commit.author_email);
+}
+
+pub const PathCommit = struct {
+    name: []u8,
+    commit: Commit,
+};
+
+pub fn freePathCommits(gpa: Allocator, items: []PathCommit) void {
+    for (items) |item| {
+        gpa.free(item.name);
+        freeCommit(gpa, item.commit);
+    }
+    gpa.free(items);
+}
+
+fn lookupCommit(self: *const Repo, oid: *const c.git_oid) Error!*c.git_commit {
+    var commit: ?*c.git_commit = null;
+    try check(c.git_commit_lookup(&commit, self.handle, oid), error.ObjectNotFound);
+    return commit.?;
+}
+
+fn commitFromC(gpa: Allocator, commit: *c.git_commit) Error!Commit {
+    const message = if (c.git_commit_message(commit)) |m| std.mem.span(m) else "";
+    const line = std.mem.trimEnd(u8, message[0 .. std.mem.indexOfScalar(u8, message, '\n') orelse message.len], " \t\r");
+    const author = c.git_commit_author(commit) orelse return error.CorruptObject;
+
+    const summary = try gpa.dupe(u8, line);
+    errdefer gpa.free(summary);
+    const name = try gpa.dupe(u8, if (author.*.name) |n| std.mem.span(n) else "");
+    errdefer gpa.free(name);
+    const email = try gpa.dupe(u8, if (author.*.email) |e| std.mem.span(e) else "");
+    return .{
+        .oid = oidFromC(c.git_commit_id(commit)),
+        .summary = summary,
+        .author_name = name,
+        .author_email = email,
+        .author_time = author.*.when.time,
+    };
+}
+
+/// Reads the summary and author of the commit `oid`. Free the result with `freeCommit`.
+/// Errors: `ObjectNotFound`.
+pub fn commitInfo(self: *const Repo, gpa: Allocator, io: Io, oid: Oid) Error!Commit {
+    _ = io;
+    const coid = try oidToC(oid);
+    const commit = try self.lookupCommit(&coid);
+    defer c.git_commit_free(commit);
+    return commitFromC(gpa, commit);
+}
+
+/// Counts the commits reachable from `oid`, like `git rev-list --count`.
+pub fn commitCount(self: *const Repo, gpa: Allocator, io: Io, oid: Oid) Error!u64 {
+    _ = gpa;
+    _ = io;
+    const coid = try oidToC(oid);
+    var walk: ?*c.git_revwalk = null;
+    try check(c.git_revwalk_new(&walk, self.handle), error.GitFailure);
+    defer c.git_revwalk_free(walk);
+    try check(c.git_revwalk_push(walk, &coid), error.ObjectNotFound);
+    var id: c.git_oid = undefined;
+    var n: u64 = 0;
+    while (true) {
+        const rc = c.git_revwalk_next(&id, walk);
+        if (rc == c.GIT_ITEROVER) return n;
+        try check(rc, error.GitFailure);
+        n += 1;
+    }
+}
+
+/// Returns an owned copy of the tree at `norm` below `root`.
+/// Errors: `PathNotFound`, `NotDir`.
+fn subTree(self: *const Repo, root: *c.git_tree, norm: [:0]const u8) Error!*c.git_tree {
+    var out: ?*c.git_tree = null;
+    if (norm.len == 0) {
+        try check(c.git_tree_dup(&out, root), error.GitFailure);
+        return out.?;
+    }
+    var entry: ?*c.git_tree_entry = null;
+    try check(c.git_tree_entry_bypath(&entry, root, norm), error.PathNotFound);
+    defer c.git_tree_entry_free(entry);
+    if (kindOfMode(c.git_tree_entry_filemode_raw(entry)) != .directory) return error.NotDir;
+    try check(c.git_tree_lookup(&out, self.handle, c.git_tree_entry_id(entry)), error.ObjectNotFound);
+    return out.?;
+}
+
+/// The tree at `norm` in `commit`, or null when the commit has no directory there.
+fn dirTreeOf(self: *const Repo, commit: *c.git_commit, norm: [:0]const u8) Error!?*c.git_tree {
+    var root: ?*c.git_tree = null;
+    try check(c.git_commit_tree(&root, commit), error.CorruptObject);
+    defer c.git_tree_free(root);
+    return self.subTree(root.?, norm) catch |err| switch (err) {
+        error.PathNotFound, error.NotDir => null,
+        else => err,
+    };
+}
+
+/// For each entry of the directory at `dir_path` in `oid` ("" for the root), finds the most recent commit
+/// reachable by first parents that changed it, in tree order. Root commits count as touching everything.
+/// Free the result with `freePathCommits`. Errors: `PathNotFound`, `NotDir`.
+pub fn lastCommits(self: *const Repo, gpa: Allocator, io: Io, oid: Oid, dir_path: []const u8) Error![]PathCommit {
+    _ = io;
+    const norm = try normalizePath(gpa, dir_path);
+    defer gpa.free(norm);
+    const start_root = try self.rootTree(oid);
+    defer c.git_tree_free(start_root);
+    const start = try self.subTree(start_root, norm);
+    defer c.git_tree_free(start);
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const count = c.git_tree_entrycount(start);
+    const names = try a.alloc([:0]u8, count);
+    const found = try a.alloc(?c.git_oid, count);
+    @memset(found, null);
+    for (names, 0..) |*name, i| {
+        const item = c.git_tree_entry_byindex(start, i) orelse return error.CorruptObject;
+        name.* = try a.dupeSentinel(u8, std.mem.span(c.git_tree_entry_name(item)), 0);
+    }
+
+    const start_oid = try oidToC(oid);
+    var walk: ?*c.git_revwalk = null;
+    try check(c.git_revwalk_new(&walk, self.handle), error.GitFailure);
+    defer c.git_revwalk_free(walk);
+    try check(c.git_revwalk_simplify_first_parent(walk), error.GitFailure);
+    try check(c.git_revwalk_push(walk, &start_oid), error.ObjectNotFound);
+
+    var remaining = count;
+    var id: c.git_oid = undefined;
+    while (remaining > 0) {
+        const rc = c.git_revwalk_next(&id, walk);
+        if (rc == c.GIT_ITEROVER) break;
+        try check(rc, error.GitFailure);
+
+        const commit = try self.lookupCommit(&id);
+        defer c.git_commit_free(commit);
+        const cur = try self.dirTreeOf(commit, norm) orelse continue;
+        defer c.git_tree_free(cur);
+
+        var prev: ?*c.git_tree = null;
+        defer if (prev) |p| c.git_tree_free(p);
+        if (c.git_commit_parentcount(commit) > 0) {
+            var parent: ?*c.git_commit = null;
+            try check(c.git_commit_parent(&parent, commit, 0), error.ObjectNotFound);
+            defer c.git_commit_free(parent);
+            prev = try self.dirTreeOf(parent.?, norm);
+        }
+        if (prev) |p| if (c.git_oid_equal(c.git_tree_id(p), c.git_tree_id(cur)) != 0) continue;
+
+        for (names, found) |name, *slot| {
+            if (slot.* != null) continue;
+            const now = c.git_tree_entry_byname(cur, name) orelse continue;
+            const touched = blk: {
+                const p = prev orelse break :blk true;
+                const before = c.git_tree_entry_byname(p, name) orelse break :blk true;
+                if (c.git_tree_entry_filemode_raw(now) != c.git_tree_entry_filemode_raw(before)) break :blk true;
+                break :blk c.git_oid_equal(c.git_tree_entry_id(now), c.git_tree_entry_id(before)) == 0;
+            };
+            if (!touched) continue;
+            slot.* = id;
+            remaining -= 1;
+        }
+    }
+
+    var out: std.ArrayList(PathCommit) = try .initCapacity(gpa, count);
+    errdefer {
+        for (out.items) |item| {
+            gpa.free(item.name);
+            freeCommit(gpa, item.commit);
+        }
+        out.deinit(gpa);
+    }
+    for (names, found) |name, slot| {
+        const last = slot orelse return error.CorruptObject;
+        const commit = try self.lookupCommit(&last);
+        defer c.git_commit_free(commit);
+        const info = try commitFromC(gpa, commit);
+        errdefer freeCommit(gpa, info);
+        const dup = try gpa.dupe(u8, name);
+        out.appendAssumeCapacity(.{ .name = dup, .commit = info });
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 const testing = std.testing;
 
 const unreadable_config_dir = "/nonexistent-git-preview-config";
@@ -858,4 +1070,175 @@ test "discover disables owner validation" {
 
 test "discover fails outside a repository" {
     try testing.expectError(error.NotARepository, Repo.discover(testing.allocator, testing.io, "/"));
+}
+
+fn commitFiles(f: *Fixture, msg: []const u8, files: []const [2][]const u8) !void {
+    for (files) |file| {
+        if (std.fs.path.dirname(file[0])) |dir| try f.tmp.dir.createDirPath(f.io, dir);
+        try f.tmp.dir.writeFile(f.io, .{ .sub_path = file[0], .data = file[1] });
+    }
+    try f.gitDiscard(&.{ "add", "-A" });
+    try f.gitDiscard(&.{ "commit", "-q", "-m", msg });
+}
+
+fn gitCount(f: *Fixture, rev: []const u8) !u64 {
+    const out = try f.git(&.{ "rev-list", "--count", rev });
+    defer f.gpa.free(out);
+    return std.fmt.parseInt(u64, std.mem.trim(u8, out, " \r\n"), 10);
+}
+
+fn expectLastCommitsMatchGit(f: *Fixture, repo: *const Repo, head: Oid, dir: []const u8) !void {
+    const gpa = f.gpa;
+    const got = try repo.lastCommits(gpa, f.io, head, dir);
+    defer freePathCommits(gpa, got);
+
+    const spec = try std.fmt.allocPrint(gpa, "HEAD:{s}", .{dir});
+    defer gpa.free(spec);
+    const listing = try f.git(&.{ "ls-tree", "--name-only", spec });
+    defer gpa.free(listing);
+    var names = std.mem.tokenizeScalar(u8, listing, '\n');
+    var i: usize = 0;
+    while (names.next()) |name| : (i += 1) {
+        try testing.expectEqualStrings(name, got[i].name);
+        const full = try std.fs.path.join(gpa, &.{ dir, name });
+        defer gpa.free(full);
+        const want = try f.git(&.{ "log", "-1", "--first-parent", "--format=%H", "HEAD", "--", full });
+        defer gpa.free(want);
+        try expectOid(try Oid.parseHex(std.mem.trim(u8, want, "\n")), got[i].commit.oid);
+    }
+    try testing.expectEqual(i, got.len);
+}
+
+test "headBranch on a branch, detached and unborn" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var f = try newFixture(gpa, io);
+    defer f.deinit();
+    gpa.free(try f.run(f.root, &.{ "init", "-q", "repo" }));
+
+    {
+        var repo = try Repo.discover(gpa, io, f.repo_path);
+        defer repo.deinit(gpa);
+        const name = (try repo.headBranch(gpa, io)).?;
+        defer gpa.free(name);
+        try testing.expectEqualStrings("main", name);
+    }
+
+    try commitFiles(&f, "one", &.{.{ "repo/a.txt", "a\n" }});
+    try f.gitDiscard(&.{ "checkout", "-q", "-b", "topic/nested" });
+    {
+        var repo = try Repo.discover(gpa, io, f.repo_path);
+        defer repo.deinit(gpa);
+        const name = (try repo.headBranch(gpa, io)).?;
+        defer gpa.free(name);
+        try testing.expectEqualStrings("topic/nested", name);
+    }
+
+    try f.gitDiscard(&.{ "checkout", "-q", "--detach" });
+    var repo = try Repo.discover(gpa, io, f.repo_path);
+    defer repo.deinit(gpa);
+    try testing.expectEqual(@as(?[]u8, null), try repo.headBranch(gpa, io));
+}
+
+test "commitInfo and commitCount agree with git" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var f = try setupFixture(gpa, io);
+    defer f.deinit();
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "repo/extra.txt", .data = "x\n" });
+    try f.gitDiscard(&.{ "add", "-A" });
+    try f.gitDiscard(&.{ "-c", "user.name=Ada L\xc3\xb6velace", "-c", "user.email=ada@example.org", "commit", "-q", "-m", "headline here  ", "-m", "body text" });
+    try f.gitDiscard(&.{ "checkout", "-q", "-b", "side", "HEAD~3" });
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "repo/side.txt", .data = "s\n" });
+    try f.gitDiscard(&.{ "add", "-A" });
+    try f.gitDiscard(&.{ "commit", "-q", "-m", "side work" });
+    try f.gitDiscard(&.{ "checkout", "-q", "main" });
+    try f.gitDiscard(&.{ "merge", "-q", "--no-ff", "-m", "merge side", "side" });
+
+    var repo = try Repo.discover(gpa, io, f.repo_path);
+    defer repo.deinit(gpa);
+
+    for ([_][]const u8{ "HEAD", "HEAD~1", "HEAD^2", "feature", "side", "v1.0^{commit}" }) |name| {
+        const oid = try f.rev(f.repo_path, name);
+        try testing.expectEqual(try gitCount(&f, name), try repo.commitCount(gpa, io, oid));
+    }
+
+    const author_commit = try repo.commitInfo(gpa, io, try f.rev(f.repo_path, "HEAD^"));
+    defer freeCommit(gpa, author_commit);
+    try testing.expectEqualStrings("headline here", author_commit.summary);
+    try testing.expectEqualStrings("Ada L\xc3\xb6velace", author_commit.author_name);
+    try testing.expectEqualStrings("ada@example.org", author_commit.author_email);
+    try expectOid(try f.rev(f.repo_path, "HEAD^"), author_commit.oid);
+    const at = try f.git(&.{ "log", "-1", "--format=%at", "HEAD^" });
+    defer gpa.free(at);
+    try testing.expectEqual(try std.fmt.parseInt(i64, std.mem.trim(u8, at, "\n"), 10), author_commit.author_time);
+
+    const merge = try repo.commitInfo(gpa, io, try f.rev(f.repo_path, "HEAD"));
+    defer freeCommit(gpa, merge);
+    try testing.expectEqualStrings("merge side", merge.summary);
+    try testing.expectEqualStrings("Test", merge.author_name);
+    try testing.expectEqualStrings("test@example.com", merge.author_email);
+
+    const missing = try Oid.parseHex("0123456789012345678901234567890123456789");
+    try testing.expectError(error.ObjectNotFound, repo.commitInfo(gpa, io, missing));
+}
+
+test "lastCommits finds the newest commit touching each entry" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var f = try newFixture(gpa, io);
+    defer f.deinit();
+    gpa.free(try f.run(f.root, &.{ "init", "-q", "repo" }));
+
+    try commitFiles(&f, "root", &.{
+        .{ "repo/old.txt", "old\n" },
+        .{ "repo/a.txt", "a1\n" },
+        .{ "repo/b.txt", "b1\n" },
+        .{ "repo/docs/x.md", "x1\n" },
+        .{ "repo/docs/z.md", "z1\n" },
+        .{ "repo/docs/deep/n.md", "n1\n" },
+    });
+    try commitFiles(&f, "touch a", &.{.{ "repo/a.txt", "a2\n" }});
+    try commitFiles(&f, "touch inner x", &.{.{ "repo/docs/x.md", "x2\n" }});
+    try commitFiles(&f, "touch deep", &.{.{ "repo/docs/deep/n.md", "n2\n" }});
+    try commitFiles(&f, "touch b", &.{.{ "repo/b.txt", "b2\n" }});
+    try f.gitDiscard(&.{ "checkout", "-q", "-b", "side", "HEAD~2" });
+    try commitFiles(&f, "side only", &.{.{ "repo/side.txt", "s\n" }});
+    try f.gitDiscard(&.{ "checkout", "-q", "main" });
+    try f.gitDiscard(&.{ "merge", "-q", "--no-ff", "-m", "merge side", "side" });
+
+    var repo = try Repo.discover(gpa, io, f.repo_path);
+    defer repo.deinit(gpa);
+    const head = try repo.resolveRev(gpa, io, "HEAD");
+
+    const root = try repo.lastCommits(gpa, io, head, "");
+    defer freePathCommits(gpa, root);
+    const want = [_]struct { []const u8, []const u8 }{
+        .{ "a.txt", "touch a" },
+        .{ "b.txt", "touch b" },
+        .{ "docs", "touch deep" },
+        .{ "old.txt", "root" },
+        .{ "side.txt", "merge side" },
+    };
+    try testing.expectEqual(want.len, root.len);
+    for (want, root) |w, got| {
+        try testing.expectEqualStrings(w[0], got.name);
+        try testing.expectEqualStrings(w[1], got.commit.summary);
+    }
+
+    try expectLastCommitsMatchGit(&f, &repo, head, "");
+    try expectLastCommitsMatchGit(&f, &repo, head, "docs");
+    try expectLastCommitsMatchGit(&f, &repo, head, "docs/deep/");
+
+    const docs = try repo.lastCommits(gpa, io, head, "docs");
+    defer freePathCommits(gpa, docs);
+    try testing.expectEqualStrings("root", docs[2].commit.summary);
+    try testing.expectEqualStrings("touch inner x", docs[1].commit.summary);
+
+    const older = try repo.lastCommits(gpa, io, try f.rev(f.repo_path, "HEAD~1"), "");
+    defer freePathCommits(gpa, older);
+    try testing.expectEqual(@as(usize, 4), older.len);
+
+    try testing.expectError(error.PathNotFound, repo.lastCommits(gpa, io, head, "nope"));
+    try testing.expectError(error.NotDir, repo.lastCommits(gpa, io, head, "a.txt"));
 }
