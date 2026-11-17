@@ -14,6 +14,26 @@ const layout =
     \\.markdown-body { box-sizing: border-box; min-width: 200px; max-width: 980px; margin: 0 auto; padding: 45px; }
     \\@media (max-width: 767px) { .markdown-body { padding: 15px; } }
     \\
+++ heading_anchors;
+
+/// github-markdown-css only styles the old anchor-inside-heading markup; GitHub now renders the
+/// anchor as the heading's sibling, hidden until the heading or the anchor is hovered or focused.
+const heading_anchors =
+    \\.markdown-body .markdown-heading { position: relative; }
+    \\.markdown-body .markdown-heading .anchor {
+    \\  position: absolute; top: 50%; left: -28px; transform: translateY(-50%);
+    \\  display: flex; align-items: center; justify-content: center;
+    \\  width: 28px; height: 28px; margin: auto; padding: 0; float: none; line-height: normal;
+    \\  border-radius: 6px; opacity: 0;
+    \\}
+    \\.markdown-body .markdown-heading h1.heading-element + .anchor,
+    \\.markdown-body .markdown-heading h2.heading-element + .anchor { transform: translateY(calc(-50% - .3rem)); }
+    \\.markdown-body .markdown-heading .heading-element:hover + .anchor,
+    \\.markdown-body .markdown-heading .anchor:hover { opacity: 1; }
+    \\.markdown-body .markdown-heading .anchor:focus { opacity: 1; outline: 2px solid var(--focus-outlineColor); outline-offset: -2px; }
+    \\.markdown-body .markdown-heading .anchor .octicon { color: var(--fgColor-default); }
+    \\@media (pointer: coarse) { .markdown-body .markdown-heading .anchor { opacity: 1; } }
+    \\
 ;
 
 pub fn write(w: *std.Io.Writer, title: []const u8, body: []const u8) !void {
