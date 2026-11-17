@@ -6,6 +6,7 @@ const c = @import("lexbor");
 const dom = @import("../html/dom.zig");
 const template = @import("template.zig");
 const time = @import("time.zig");
+const Zone = @import("Zone.zig");
 const octicons = @import("../render/octicons.zig");
 const Repo = @import("../repo/Repo.zig");
 const Node = dom.Node;
@@ -26,6 +27,7 @@ pub const Data = struct {
     head: Repo.Commit,
     entries: []const Entry,
     now: i64,
+    zone: *const Zone,
 };
 
 pub fn fill(gpa: std.mem.Allocator, page: *template.Page, data: Data) !void {
@@ -86,12 +88,12 @@ fn writeEscaped(w: *std.Io.Writer, s: []const u8) !void {
     };
 }
 
-fn writeRelativeTime(w: *std.Io.Writer, t: i64, now: i64) !void {
+fn writeRelativeTime(w: *std.Io.Writer, t: i64, now: i64, zone: *const Zone) !void {
     var a: [64]u8 = undefined;
     var b: [64]u8 = undefined;
     var r: [64]u8 = undefined;
     try w.print("<relative-time data-component=\"RelativeTime\" tense=\"past\" datetime=\"{s}\" title=\"{s}\">{s}</relative-time>", .{
-        time.iso(&a, t), time.title(&b, t), time.relative(&r, t, now),
+        time.iso(&a, t), time.title(&b, t, zone), time.relative(&r, t, now, zone),
     });
 }
 
@@ -117,7 +119,7 @@ fn setLatestCommit(gpa: std.mem.Allocator, page: *template.Page, data: Data) !vo
     try w.writeAll("\">");
     try writeEscaped(w, head.summary);
     try w.writeAll("</a></span></div></div><span class=\"d-flex d-sm-none fgColor-muted\">");
-    try writeRelativeTime(w, head.author_time, data.now);
+    try writeRelativeTime(w, head.author_time, data.now, data.zone);
     try w.writeAll("</span></div>");
     try page.setInnerHtml(loading, "gp-latest", try gpa.dupe(u8, bar.written()));
     unwrapMarkerHost(loading);
@@ -128,7 +130,7 @@ fn setLatestCommit(gpa: std.mem.Allocator, page: *template.Page, data: Data) !vo
         try info.writer.print("<span class=\"d-flex flex-nowrap fgColor-muted f6\"><a class=\"Link--secondary {s}\" aria-label=\"Commit {s}\" href=\"", .{ page.class("prc-Link-Link", ""), sha[0..7] });
         try commitHref(&info.writer, data, head);
         try info.writer.print("\">{s}</a>&nbsp;·&nbsp;", .{sha[0..7]});
-        try writeRelativeTime(&info.writer, head.author_time, data.now);
+        try writeRelativeTime(&info.writer, head.author_time, data.now, data.zone);
         try info.writer.writeAll("</span>");
         try page.setInnerHtml(d, "gp-latest-details", try gpa.dupe(u8, info.written()));
     }
@@ -202,7 +204,7 @@ fn writeRow(w: *std.Io.Writer, data: Data, e: Entry, i: usize) !void {
     try w.writeAll("\">");
     try writeEscaped(w, e.commit.summary);
     try w.writeAll("</a></div></div></td><td><div class=\"react-directory-commit-age\">");
-    try writeRelativeTime(w, e.commit.author_time, data.now);
+    try writeRelativeTime(w, e.commit.author_time, data.now, data.zone);
     try w.writeAll("</div></td></tr>");
 }
 
@@ -238,6 +240,7 @@ test "fills the skeleton regions of a repo page template" {
             .{ .name = "src", .kind = .directory, .commit = commit },
         },
         .now = 1000 + 2 * 86400,
+        .zone = &Zone.utc,
     });
     const html = try page.serialize(arena);
 

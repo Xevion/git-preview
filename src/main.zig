@@ -10,6 +10,7 @@ const Resolver = @import("urls.zig").Resolver;
 const Fetcher = @import("net/Fetcher.zig");
 const template = @import("chrome/template.zig");
 const home = @import("chrome/home.zig");
+const Zone = @import("chrome/Zone.zig");
 
 const params = clap.parseParamsComptime(
     \\-h, --help            Show this help and exit.
@@ -155,7 +156,7 @@ fn run(
     const full_page = args.@"readme-only" == 0 and file_abs == null and kind == .github and remote != null;
     const html = blk: {
         if (full_page) {
-            if (repoPage(arena, io, &fetcher, &repo, args.rev, head_oid, remote.?, fragment)) |p| break :blk p else |err| {
+            if (repoPage(arena, io, env, &fetcher, &repo, args.rev, head_oid, remote.?, fragment)) |p| break :blk p else |err| {
                 try stderr.print("git-preview: repository page unavailable ({s}), writing the README alone\n", .{@errorName(err)});
             }
         }
@@ -177,17 +178,17 @@ fn run(
 }
 
 /// The repo home page from github.com with our README swapped into its README box.
-fn repoPage(arena: std.mem.Allocator, io: std.Io, fetcher: *Fetcher, repo: *const Repo, rev: ?[]const u8, head: ?Repo.Oid, remote: forge.Remote, readme: []const u8) ![]u8 {
+fn repoPage(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, fetcher: *Fetcher, repo: *const Repo, rev: ?[]const u8, head: ?Repo.Oid, remote: forge.Remote, readme: []const u8) ![]u8 {
     const url = try std.fmt.allocPrint(arena, "https://{s}/{s}", .{ remote.host, remote.path });
     var tpl = try template.load(arena, fetcher, url);
     defer tpl.deinit();
     const article = template.readmeArticle(&tpl) orelse return error.TemplateWithoutReadme;
     try tpl.setInnerHtml(article, "gp-readme", readme);
-    if (head) |oid| try home.fill(arena, &tpl, try homeData(arena, io, repo, rev, oid, remote));
+    if (head) |oid| try home.fill(arena, &tpl, try homeData(arena, io, env, repo, rev, oid, remote));
     return tpl.serialize(arena);
 }
 
-fn homeData(arena: std.mem.Allocator, io: std.Io, repo: *const Repo, rev: ?[]const u8, oid: Repo.Oid, remote: forge.Remote) !home.Data {
+fn homeData(arena: std.mem.Allocator, io: std.Io, env: *const std.process.Environ.Map, repo: *const Repo, rev: ?[]const u8, oid: Repo.Oid, remote: forge.Remote) !home.Data {
     var hex: [Repo.Oid.max_hex_len]u8 = undefined;
     const ref = rev orelse try repo.headBranch(arena, io) orelse try arena.dupe(u8, oid.hex(&hex)[0..7]);
     const tree = try repo.listTree(arena, io, oid, "");
@@ -199,6 +200,8 @@ fn homeData(arena: std.mem.Allocator, io: std.Io, repo: *const Repo, rev: ?[]con
         } else return error.MissingLastCommit;
         e.* = .{ .name = t.name, .kind = t.kind, .commit = found };
     }
+    const zone = try arena.create(Zone);
+    zone.* = Zone.load(arena, io, env);
     return .{
         .repo_path = remote.path,
         .ref = ref,
@@ -206,6 +209,7 @@ fn homeData(arena: std.mem.Allocator, io: std.Io, repo: *const Repo, rev: ?[]con
         .head = try repo.commitInfo(arena, io, oid),
         .entries = entries,
         .now = std.Io.Clock.real.now(io).toSeconds(),
+        .zone = zone,
     };
 }
 
