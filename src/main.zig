@@ -10,6 +10,7 @@ const Resolver = @import("urls.zig").Resolver;
 
 const params = clap.parseParamsComptime(
     \\-h, --help            Show this help and exit.
+    \\-V, --version         Print the version and exit.
     \\-o, --output <str>    Write the page here instead of a stable path under $TMPDIR/git-preview.
     \\-r, --rev <str>       Render committed content at this revision instead of the working tree.
     \\    --remote <str>    Remote whose host decides the forge (default: origin, else the only remote).
@@ -38,6 +39,13 @@ pub fn main(init: std.process.Init) !u8 {
     };
     defer res.deinit();
 
+    if (res.args.version != 0) {
+        var out_buf: [64]u8 = undefined;
+        var out: std.Io.File.Writer = .init(.stdout(), io, &out_buf);
+        try out.interface.print("git-preview {s}\n", .{@import("build_options").version});
+        try out.interface.flush();
+        return 0;
+    }
     if (res.args.help != 0) {
         try stderr.writeAll("Usage: git-preview [options] [FILE]\n\n");
         try clap.help(stderr, clap.Help, &params, .{});

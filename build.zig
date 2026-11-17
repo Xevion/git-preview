@@ -14,6 +14,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    exe_mod.addOptions("build_options", options);
     cmark.build(b, target, optimize).addTo(exe_mod, "cmark");
     lexbor.build(b, target, optimize).addTo(exe_mod, "lexbor");
     libgit2.build(b, target, optimize).addTo(exe_mod, "git2");
