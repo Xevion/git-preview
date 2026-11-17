@@ -19,6 +19,7 @@ pub fn build(b: *std.Build) void {
     const zg = b.dependency("zg", .{ .target = target, .optimize = optimize });
     exe_mod.addImport("LetterCasing", zg.module("LetterCasing"));
     exe_mod.addImport("GeneralCategories", zg.module("GeneralCategories"));
+    exe_mod.addImport("clap", b.dependency("clap", .{ .target = target, .optimize = optimize }).module("clap"));
     addAssets(b, exe_mod);
     emoji.addTo(b, exe_mod);
 
