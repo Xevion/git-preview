@@ -48,6 +48,10 @@
             .url = "https://codeberg.org/atman/zg/archive/v0.18.0.tar.gz",
             .hash = "zg-0.18.0-oGqU3MjboAJAkIdf1n_G20BmpEZs_f30RMCacLPVlTXU",
         },
+        .lexbor = .{
+            .url = "https://github.com/lexbor/lexbor/archive/refs/tags/v3.0.0.tar.gz",
+            .hash = "N-V-__8AAMxVvAIalChC2bXMLXbWpURCkFNzlDy86Nwguncd",
+        },
     },
     .paths = .{
         "build.zig",

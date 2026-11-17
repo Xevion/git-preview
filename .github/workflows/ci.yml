@@ -21,7 +21,7 @@ jobs:
         with:
           path: zig-pkg
           key: zig-pkg-${{ hashFiles('build.zig.zon') }}
-      - run: zig fmt --check build.zig src
+      - run: zig fmt --check build.zig build src
       - run: zig build check
 
   test:
