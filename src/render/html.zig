@@ -3,7 +3,7 @@
 const std = @import("std");
 const c = @import("cmark");
 const octicons = @import("octicons.zig");
-const sanitize = @import("sanitize.zig");
+const filter = @import("../html/filter.zig");
 const Slugger = @import("slug.zig").Slugger;
 const Writer = std.Io.Writer;
 const Node = c.cmark_node;
@@ -17,7 +17,9 @@ pub const Options = struct {
     own_host: []const u8 = "github.com",
     /// Suffix that keeps footnote ids unique when several documents share a page.
     footnote_suffix: []const u8 = "",
-    rewriter: sanitize.UrlRewriter = .identity,
+    rewriter: filter.UrlRewriter = .identity,
+    /// Brackets raw HTML in marker comments so the DOM pass knows which elements to sanitize.
+    raw_nonce: []const u8 = "",
 };
 
 pub fn render(gpa: std.mem.Allocator, w: *Writer, doc: *Node, options: Options) !void {
@@ -26,7 +28,6 @@ pub fn render(gpa: std.mem.Allocator, w: *Writer, doc: *Node, options: Options) 
         .w = w,
         .opts = options,
         .slugger = .init(gpa),
-        .raw = .{ .rewriter = options.rewriter },
     };
     defer r.slugger.deinit();
     try r.children(doc);
@@ -38,7 +39,6 @@ const Renderer = struct {
     w: *Writer,
     opts: Options,
     slugger: Slugger,
-    raw: sanitize.State,
     footnote_count: u32 = 0,
     /// Mirrors cmark's `cr()`: tracks whether output currently ends in a newline.
     at_line_start: bool = true,
@@ -119,7 +119,9 @@ const Renderer = struct {
     }
 
     fn rawHtml(r: *Renderer, src: []const u8) !void {
-        try sanitize.sanitize(&r.raw, r.w, src);
+        try r.print("<!--gp-raw:{s}-->", .{r.opts.raw_nonce});
+        try filter.writeTagFiltered(r.w, src);
+        try r.print("<!--gp-end:{s}-->", .{r.opts.raw_nonce});
         if (src.len > 0) r.at_line_start = src[src.len - 1] == '\n';
     }
 
@@ -321,17 +323,14 @@ const Renderer = struct {
     }
 
     fn isExternal(r: *Renderer, url: []const u8) bool {
-        const scheme_end = std.mem.indexOf(u8, url, "://") orelse return false;
-        const rest = url[scheme_end + 3 ..];
-        const host_end = std.mem.indexOfAny(u8, rest, "/:?#") orelse rest.len;
-        return !std.ascii.eqlIgnoreCase(rest[0..host_end], r.opts.own_host);
+        return filter.isExternal(url, r.opts.own_host);
     }
 
     fn link(r: *Renderer, n: *Node) !void {
         const url = std.mem.span(c.cmark_node_get_url(n));
         const title = std.mem.span(c.cmark_node_get_title(n));
         try r.out("<a");
-        if (sanitize.safeUrl(url)) {
+        if (filter.safeUrl(url)) {
             try r.out(" href=\"");
             try r.href(try r.opts.rewriter.link(url));
             try r.out("\"");
@@ -343,9 +342,7 @@ const Renderer = struct {
         }
         if (r.isExternal(url)) try r.out(" rel=\"nofollow\"");
         try r.out(">");
-        r.raw.link_depth += 1;
         try r.children(n);
-        r.raw.link_depth -= 1;
         try r.out("</a>");
     }
 
@@ -354,15 +351,9 @@ const Renderer = struct {
         const title = std.mem.span(c.cmark_node_get_title(n));
         const alt = try plainText(r.gpa, n);
         defer r.gpa.free(alt);
-        const safe = sanitize.safeUrl(url);
+        const safe = filter.safeUrl(url);
         const src = if (safe) try r.opts.rewriter.image(url) else "";
         const external = r.isExternal(url);
-        const wrap_link = r.raw.link_depth == 0 and safe;
-        if (wrap_link) {
-            try r.out(if (external) "<a target=\"_blank\" rel=\"noopener noreferrer nofollow\" href=\"" else "<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"");
-            try r.href(src);
-            try r.out("\">");
-        }
         try r.out("<img");
         if (safe) {
             try r.out(" src=\"");
@@ -383,7 +374,6 @@ const Renderer = struct {
             try r.out("\"");
         }
         try r.out(" style=\"max-width: 100%;\">");
-        if (wrap_link) try r.out("</a>");
     }
 
     /// Percent-encodes what cmark's href escaper does; `data:` URIs pass through untouched.

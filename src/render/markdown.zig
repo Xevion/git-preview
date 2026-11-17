@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("cmark");
 const html = @import("html.zig");
+const filter = @import("../html/filter.zig");
 
 pub const Options = html.Options;
 
@@ -26,10 +27,21 @@ pub fn toHtml(gpa: std.mem.Allocator, source: []const u8, options: Options) ![]u
     const doc = c.cmark_parser_finish(parser) orelse return error.OutOfMemory;
     defer c.cmark_node_free(doc);
 
+    // Derived from the source, so a document cannot contain the marker it would need to forge.
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
+    const nonce = std.fmt.bytesToHex(digest[0..8], .lower);
+    var render_opts = options;
+    render_opts.raw_nonce = &nonce;
+
     var out: std.Io.Writer.Allocating = .init(gpa);
-    errdefer out.deinit();
-    try html.render(gpa, &out.writer, doc, options);
-    return out.toOwnedSlice();
+    defer out.deinit();
+    try html.render(gpa, &out.writer, doc, render_opts);
+    return filter.finalize(gpa, out.written(), .{
+        .nonce = &nonce,
+        .own_host = options.own_host,
+        .rewriter = options.rewriter,
+    });
 }
 
 /// Strips what legitimately differs from GitHub's output: footnote hash suffixes and camo image proxying.
