@@ -1,0 +1,171 @@
+<div id="readme" class="md" data-path="README.md"><article class="markdown-body entry-content container-lg" itemprop="text"><div class="markdown-heading" dir="auto"><h1 class="heading-element" dir="auto">cmark-gfm</h1><a id="user-content-cmark-gfm" class="anchor" aria-label="Permalink: cmark-gfm" href="#cmark-gfm"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<p dir="auto"><a target="_blank" rel="noopener noreferrer" href="https://github.com/github/cmark-gfm/actions/workflows/ci.yml/badge.svg"><img src="https://github.com/github/cmark-gfm/actions/workflows/ci.yml/badge.svg" alt="Actions CI" style="max-width: 100%;"></a></p>
+<p dir="auto"><code>cmark-gfm</code> is an extended version of the C reference implementation of
+<a href="http://commonmark.org" rel="nofollow">CommonMark</a>, a rationalized version of Markdown syntax with a spec.  This
+repository adds GitHub Flavored Markdown extensions to
+<a href="https://github.com/jgm/cmark">the upstream implementation</a>, as defined in <a href="https://github.github.com/gfm/">the spec</a>.</p>
+<p dir="auto">The rest of the README is preserved as-is from the upstream source.  Note that
+the library and binaries produced by this fork are suffixed with <code>-gfm</code> in
+order to distinguish them from the upstream.</p>
+<hr>
+<p dir="auto">It provides a shared library (<code>libcmark</code>) with functions for parsing
+CommonMark documents to an abstract syntax tree (AST), manipulating
+the AST, and rendering the document to HTML, groff man, LaTeX,
+CommonMark, or an XML representation of the AST.  It also provides a
+command-line program (<code>cmark</code>) for parsing and rendering CommonMark
+documents.</p>
+<p dir="auto">Advantages of this library:</p>
+<ul dir="auto">
+<li>
+<p dir="auto"><strong>Portable.</strong>  The library and program are written in standard
+C99 and have no external dependencies.  They have been tested with
+MSVC, gcc, tcc, and clang.</p>
+</li>
+<li>
+<p dir="auto"><strong>Fast.</strong> cmark can render a Markdown version of <em>War and Peace</em> in
+the blink of an eye (127 milliseconds on a ten year old laptop,
+vs. 100-400 milliseconds for an eye blink).  In our <a href="benchmarks.md">benchmarks</a>,
+cmark is 10,000 times faster than the original <code>Markdown.pl</code>, and
+on par with the very fastest available Markdown processors.</p>
+</li>
+<li>
+<p dir="auto"><strong>Accurate.</strong> The library passes all CommonMark conformance tests.</p>
+</li>
+<li>
+<p dir="auto"><strong>Standardized.</strong> The library can be expected to parse CommonMark
+the same way as any other conforming parser.  So, for example,
+you can use <code>commonmark.js</code> on the client to preview content that
+will be rendered on the server using <code>cmark</code>.</p>
+</li>
+<li>
+<p dir="auto"><strong>Robust.</strong> The library has been extensively fuzz-tested using
+<a href="http://lcamtuf.coredump.cx/afl/" rel="nofollow">american fuzzy lop</a>.  The test suite includes pathological cases
+that bring many other Markdown parsers to a crawl (for example,
+thousands-deep nested bracketed text or block quotes).</p>
+</li>
+<li>
+<p dir="auto"><strong>Flexible.</strong> CommonMark input is parsed to an AST which can be
+manipulated programmatically prior to rendering.</p>
+</li>
+<li>
+<p dir="auto"><strong>Multiple renderers.</strong>  Output in HTML, groff man, LaTeX, CommonMark,
+and a custom XML format is supported. And it is easy to write new
+renderers to support other formats.</p>
+</li>
+<li>
+<p dir="auto"><strong>Free.</strong> BSD2-licensed.</p>
+</li>
+</ul>
+<p dir="auto">It is easy to use <code>libcmark</code> in python, lua, ruby, and other dynamic
+languages: see the <code>wrappers/</code> subdirectory for some simple examples.</p>
+<p dir="auto">There are also libraries that wrap <code>libcmark</code> for
+<a href="https://github.com/rhinoman/go-commonmark">Go</a>,
+<a href="https://hackage.haskell.org/package/cmark" rel="nofollow">Haskell</a>,
+<a href="https://github.com/gjtorikian/commonmarker">Ruby</a>,
+<a href="https://github.com/jgm/cmark-lua">Lua</a>,
+<a href="https://metacpan.org/release/CommonMark" rel="nofollow">Perl</a>,
+<a href="https://pypi.python.org/pypi/paka.cmark" rel="nofollow">Python</a>,
+<a href="https://cran.r-project.org/package=commonmark" rel="nofollow">R</a>,
+<a href="https://github.com/apnadkarni/tcl-cmark">Tcl</a>,
+<a href="https://github.com/sparsetech/cmark-scala">Scala</a> and
+<a href="https://github.com/killa123/node-cmark">Node.js</a>.</p>
+<div class="markdown-heading" dir="auto"><h2 class="heading-element" dir="auto">Installing</h2><a id="user-content-installing" class="anchor" aria-label="Permalink: Installing" href="#installing"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<p dir="auto">Building the C program (<code>cmark</code>) and shared library (<code>libcmark</code>)
+requires <a href="http://www.cmake.org/download/" rel="nofollow">cmake</a>.  If you modify <code>scanners.re</code>, then you will also
+need <a href="http://re2c.org" rel="nofollow">re2c</a> (&gt;= 0.14.2), which is used to generate <code>scanners.c</code> from
+<code>scanners.re</code>.  We have included a pre-generated <code>scanners.c</code> in
+the repository to reduce build dependencies.</p>
+<p dir="auto">If you have GNU make, you can simply <code>make</code>, <code>make test</code>, and <code>make install</code>.  This calls <a href="http://www.cmake.org/download/" rel="nofollow">cmake</a> to create a <code>Makefile</code> in the <code>build</code>
+directory, then uses that <code>Makefile</code> to create the executable and
+library.  The binaries can be found in <code>build/src</code>.  The default
+installation prefix is <code>/usr/local</code>.  To change the installation
+prefix, pass the <code>INSTALL_PREFIX</code> variable if you run <code>make</code> for the
+first time: <code>make INSTALL_PREFIX=path</code>.</p>
+<p dir="auto">For a more portable method, you can use <a href="http://www.cmake.org/download/" rel="nofollow">cmake</a> manually. <a href="http://www.cmake.org/download/" rel="nofollow">cmake</a> knows
+how to create build environments for many build systems.  For example,
+on FreeBSD:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="mkdir build
+cd build
+cmake ..  # optionally: -DCMAKE_INSTALL_PREFIX=path
+make      # executable will be created as build/src/cmark
+make test
+make install"><pre class="notranslate"><code>mkdir build
+cd build
+cmake ..  # optionally: -DCMAKE_INSTALL_PREFIX=path
+make      # executable will be created as build/src/cmark
+make test
+make install
+</code></pre></div>
+<p dir="auto">Or, to create Xcode project files on OSX:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="mkdir build
+cd build
+cmake -G Xcode ..
+open cmark.xcodeproj"><pre class="notranslate"><code>mkdir build
+cd build
+cmake -G Xcode ..
+open cmark.xcodeproj
+</code></pre></div>
+<p dir="auto">The GNU Makefile also provides a few other targets for developers.
+To run a benchmark:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="make bench"><pre class="notranslate"><code>make bench
+</code></pre></div>
+<p dir="auto">For more detailed benchmarks:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="make newbench"><pre class="notranslate"><code>make newbench
+</code></pre></div>
+<p dir="auto">To run a test for memory leaks using <code>valgrind</code>:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="make leakcheck"><pre class="notranslate"><code>make leakcheck
+</code></pre></div>
+<p dir="auto">To reformat source code using <code>clang-format</code>:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="make format"><pre class="notranslate"><code>make format
+</code></pre></div>
+<p dir="auto">To run a "fuzz test" against ten long randomly generated inputs:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="make fuzztest"><pre class="notranslate"><code>make fuzztest
+</code></pre></div>
+<p dir="auto">To do a more systematic fuzz test with <a href="http://lcamtuf.coredump.cx/afl/" rel="nofollow">american fuzzy lop</a>:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="AFL_PATH=/path/to/afl_directory make afl"><pre class="notranslate"><code>AFL_PATH=/path/to/afl_directory make afl
+</code></pre></div>
+<p dir="auto">Fuzzing with <a href="http://llvm.org/docs/LibFuzzer.html" rel="nofollow">libFuzzer</a> is also supported but, because libFuzzer is still
+under active development, may not work with your system-installed version of
+clang. Assuming LLVM has been built in <code>$HOME/src/llvm/build</code> the fuzzer can be
+run with:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="CC=&quot;$HOME/src/llvm/build/bin/clang&quot; LIB_FUZZER_PATH=&quot;$HOME/src/llvm/lib/Fuzzer/libFuzzer.a&quot; make libFuzzer"><pre class="notranslate"><code>CC="$HOME/src/llvm/build/bin/clang" LIB_FUZZER_PATH="$HOME/src/llvm/lib/Fuzzer/libFuzzer.a" make libFuzzer
+</code></pre></div>
+<p dir="auto">To make a release tarball and zip archive:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="make archive"><pre class="notranslate"><code>make archive
+</code></pre></div>
+<div class="markdown-heading" dir="auto"><h2 class="heading-element" dir="auto">Installing (Windows)</h2><a id="user-content-installing-windows" class="anchor" aria-label="Permalink: Installing (Windows)" href="#installing-windows"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<p dir="auto">To compile with MSVC and NMAKE:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="nmake"><pre class="notranslate"><code>nmake
+</code></pre></div>
+<p dir="auto">You can cross-compile a Windows binary and dll on linux if you have the
+<code>mingw32</code> compiler:</p>
+<div class="snippet-clipboard-content notranslate position-relative overflow-auto" data-snippet-clipboard-copy-content="make mingw"><pre class="notranslate"><code>make mingw
+</code></pre></div>
+<p dir="auto">The binaries will be in <code>build-mingw/windows/bin</code>.</p>
+<div class="markdown-heading" dir="auto"><h2 class="heading-element" dir="auto">Usage</h2><a id="user-content-usage" class="anchor" aria-label="Permalink: Usage" href="#usage"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<p dir="auto">Instructions for the use of the command line program and library can
+be found in the man pages in the <code>man</code> subdirectory.</p>
+<div class="markdown-heading" dir="auto"><h2 class="heading-element" dir="auto">Security</h2><a id="user-content-security" class="anchor" aria-label="Permalink: Security" href="#security"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<p dir="auto">By default, the library will scrub raw HTML and potentially
+dangerous links (<code>javascript:</code>, <code>vbscript:</code>, <code>data:</code>, <code>file:</code>).</p>
+<p dir="auto">To allow these, use the option <code>CMARK_OPT_UNSAFE</code> (or
+<code>--unsafe</code>) with the command line program. If doing so, we
+recommend you use a HTML sanitizer specific to your needs to
+protect against <a href="http://en.wikipedia.org/wiki/Cross-site_scripting" rel="nofollow">XSS
+attacks</a>.</p>
+<div class="markdown-heading" dir="auto"><h2 class="heading-element" dir="auto">Contributing</h2><a id="user-content-contributing" class="anchor" aria-label="Permalink: Contributing" href="#contributing"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<p dir="auto">There is a <a href="http://talk.commonmark.org" rel="nofollow">forum for discussing
+CommonMark</a>; you should use it instead of
+github issues for questions and possibly open-ended discussions.
+Use the <a href="http://github.com/commonmark/CommonMark/issues">github issue tracker</a>
+only for simple, clear, actionable issues.</p>
+<div class="markdown-heading" dir="auto"><h2 class="heading-element" dir="auto">Authors</h2><a id="user-content-authors" class="anchor" aria-label="Permalink: Authors" href="#authors"><svg data-component="Octicon" class="octicon octicon-link" viewBox="0 0 16 16" version="1.1" width="16" height="16" aria-hidden="true"><path d="m7.775 3.275 1.25-1.25a3.5 3.5 0 1 1 4.95 4.95l-2.5 2.5a3.5 3.5 0 0 1-4.95 0 .751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018 1.998 1.998 0 0 0 2.83 0l2.5-2.5a2.002 2.002 0 0 0-2.83-2.83l-1.25 1.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042Zm-4.69 9.64a1.998 1.998 0 0 0 2.83 0l1.25-1.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042l-1.25 1.25a3.5 3.5 0 1 1-4.95-4.95l2.5-2.5a3.5 3.5 0 0 1 4.95 0 .751.751 0 0 1-.018 1.042.751.751 0 0 1-1.042.018 1.998 1.998 0 0 0-2.83 0l-2.5 2.5a1.998 1.998 0 0 0 0 2.83Z"></path></svg></a></div>
+<p dir="auto">John MacFarlane wrote the original library and program.
+The block parsing algorithm was worked out together with David
+Greenspan. Vicent Marti optimized the C implementation for
+performance, increasing its speed tenfold.  Kārlis Gaņģis helped
+work out a better parsing algorithm for links and emphasis,
+eliminating several worst-case performance issues.
+Nick Wellnhofer contributed many improvements, including
+most of the C library's API and its test harness.</p>
+</article></div>

@@ -1,17 +1,20 @@
 const std = @import("std");
 const c = @import("cmark");
+const html = @import("html.zig");
+
+pub const Options = html.Options;
 
 /// The GFM extensions GitHub enables on top of CommonMark.
 const extensions = [_][:0]const u8{ "table", "strikethrough", "autolink", "tagfilter", "tasklist" };
 
 /// Raw HTML is kept because GitHub sanitizes after rendering rather than refusing it outright.
-const options: c_int = c.CMARK_OPT_UNSAFE | c.CMARK_OPT_FOOTNOTES | c.CMARK_OPT_GITHUB_PRE_LANG;
+const parse_options: c_int = c.CMARK_OPT_UNSAFE | c.CMARK_OPT_FOOTNOTES | c.CMARK_OPT_GITHUB_PRE_LANG;
 
 /// Renders GitHub-flavored Markdown to an HTML fragment owned by `gpa`.
-pub fn toHtml(gpa: std.mem.Allocator, source: []const u8) ![]u8 {
+pub fn toHtml(gpa: std.mem.Allocator, source: []const u8, options: Options) ![]u8 {
     c.cmark_gfm_core_extensions_ensure_registered();
 
-    const parser = c.cmark_parser_new(options) orelse return error.OutOfMemory;
+    const parser = c.cmark_parser_new(parse_options) orelse return error.OutOfMemory;
     defer c.cmark_parser_free(parser);
 
     for (extensions) |name| {
@@ -23,24 +26,66 @@ pub fn toHtml(gpa: std.mem.Allocator, source: []const u8) ![]u8 {
     const doc = c.cmark_parser_finish(parser) orelse return error.OutOfMemory;
     defer c.cmark_node_free(doc);
 
-    const html = c.cmark_render_html(doc, options, c.cmark_parser_get_syntax_extensions(parser)) orelse
-        return error.OutOfMemory;
-    defer c.free(html);
-
-    return gpa.dupe(u8, std.mem.span(html));
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    errdefer out.deinit();
+    try html.render(gpa, &out.writer, doc, options);
+    return out.toOwnedSlice();
 }
 
-test "renders a GFM table and task list" {
+/// Strips what legitimately differs from GitHub's output: footnote hash suffixes and camo image proxying.
+fn normalizeGolden(gpa: std.mem.Allocator, golden: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    const camo = "https://camo.githubusercontent.com/";
+    var i: usize = 0;
+    while (i < golden.len) {
+        if (golden[i] == '-' and i + 33 < golden.len and golden[i + 33] == '"' and isHex(golden[i + 1 .. i + 33])) {
+            i += 33;
+            continue;
+        }
+        if (std.mem.startsWith(u8, golden[i..], camo)) {
+            const rest = golden[i + camo.len ..];
+            const slash = std.mem.indexOfScalar(u8, rest, '/').?;
+            const end = std.mem.indexOfScalar(u8, rest, '"').?;
+            const encoded = rest[slash + 1 .. end];
+            const decoded = try out.addManyAsSlice(gpa, encoded.len / 2);
+            _ = try std.fmt.hexToBytes(decoded, encoded);
+            i += camo.len + end;
+            continue;
+        }
+        try out.append(gpa, golden[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn isHex(s: []const u8) bool {
+    for (s) |ch| if (!std.ascii.isHex(ch) or std.ascii.isUpper(ch)) return false;
+    return true;
+}
+
+test "matches GitHub's recorded output for each fixture" {
     const gpa = std.testing.allocator;
-    const html = try toHtml(gpa,
-        \\| a | b |
-        \\|---|---|
-        \\| 1 | 2 |
-        \\
-        \\- [x] done
-        \\
-    );
-    defer gpa.free(html);
-    try std.testing.expect(std.mem.indexOf(u8, html, "<table>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, html, "type=\"checkbox\"") != null);
+    const io = std.testing.io;
+    const fixtures = [_][]const u8{ "basics", "blocks", "alerts" };
+    for (fixtures) |name| {
+        const md_path = try std.fmt.allocPrint(gpa, "tests/markdown/{s}.md", .{name});
+        defer gpa.free(md_path);
+        const golden_path = try std.fmt.allocPrint(gpa, "tests/markdown/{s}.github.html", .{name});
+        defer gpa.free(golden_path);
+
+        const source = try std.Io.Dir.cwd().readFileAlloc(io, md_path, gpa, .limited(1 << 20));
+        defer gpa.free(source);
+        const golden_raw = try std.Io.Dir.cwd().readFileAlloc(io, golden_path, gpa, .limited(1 << 20));
+        defer gpa.free(golden_raw);
+        const golden = try normalizeGolden(gpa, golden_raw);
+        defer gpa.free(golden);
+
+        const got = try toHtml(gpa, source, .{ .soft_break = .hard, .heading_anchors = false });
+        defer gpa.free(got);
+        std.testing.expectEqualStrings(std.mem.trimEnd(u8, golden, "\n"), std.mem.trimEnd(u8, got, "\n")) catch |err| {
+            std.debug.print("fixture {s} differs from GitHub\n", .{name});
+            return err;
+        };
+    }
 }
