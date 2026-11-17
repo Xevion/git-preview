@@ -222,6 +222,51 @@ pub fn remoteUrl(self: *const Repo, gpa: Allocator, io: Io, name: ?[]const u8) E
     return try gpa.dupe(u8, std.mem.span(url));
 }
 
+/// The last-fetched tip of `branch` on remote `name` (`origin` or the sole remote when null), falling back
+/// to that remote's HEAD; null when neither was ever fetched.
+pub fn remoteTip(self: *const Repo, gpa: Allocator, io: Io, name: ?[]const u8, branch: ?[]const u8) Error!?Oid {
+    const remote = (if (name) |n|
+        try self.lookupRemote(n)
+    else
+        try self.lookupRemote("origin") orelse try self.soleRemote()) orelse return null;
+    defer c.git_remote_free(remote);
+    const remote_name = std.mem.span(c.git_remote_name(remote) orelse return null);
+    var buf: [512]u8 = undefined;
+    if (branch) |b| {
+        const ref = std.fmt.bufPrint(&buf, "refs/remotes/{s}/{s}", .{ remote_name, b }) catch return null;
+        if (self.resolveRev(gpa, io, ref)) |oid| return oid else |err| if (err != error.RevisionNotFound) return err;
+    }
+    const head = std.fmt.bufPrint(&buf, "refs/remotes/{s}/HEAD", .{remote_name}) catch return null;
+    return self.resolveRev(gpa, io, head) catch |err| switch (err) {
+        error.RevisionNotFound => null,
+        else => err,
+    };
+}
+
+/// The newest commit reachable from `start` authored by `email` (case-insensitive), within `limit` commits.
+pub fn newestByAuthor(self: *const Repo, gpa: Allocator, io: Io, start: Oid, email: []const u8, limit: usize) Error!?Oid {
+    _ = gpa;
+    _ = io;
+    const coid = try oidToC(start);
+    var walk: ?*c.git_revwalk = null;
+    try check(c.git_revwalk_new(&walk, self.handle), error.GitFailure);
+    defer c.git_revwalk_free(walk);
+    try check(c.git_revwalk_sorting(walk, c.GIT_SORT_TIME), error.GitFailure);
+    try check(c.git_revwalk_push(walk, &coid), error.ObjectNotFound);
+    var id: c.git_oid = undefined;
+    for (0..limit) |_| {
+        const rc = c.git_revwalk_next(&id, walk);
+        if (rc == c.GIT_ITEROVER) return null;
+        try check(rc, error.GitFailure);
+        const commit = try self.lookupCommit(&id);
+        defer c.git_commit_free(commit);
+        const author = c.git_commit_author(commit) orelse continue;
+        const e = if (author.*.email) |p| std.mem.span(p) else continue;
+        if (std.ascii.eqlIgnoreCase(e, email)) return oidFromC(&id);
+    }
+    return null;
+}
+
 /// Resolves any revision expression (ref name, full or short id, `HEAD~2`, `v1^{commit}`) to an object id,
 /// peeling annotated tags down to the tagged object.
 pub fn resolveRev(self: *const Repo, gpa: Allocator, io: Io, rev: []const u8) Error!Oid {
@@ -364,6 +409,10 @@ pub const Commit = struct {
     author_email: []u8,
     /// Unix seconds.
     author_time: i64,
+    /// Unix seconds; what forges date a commit by.
+    commit_time: i64,
+    /// The message continues past its first line.
+    has_body: bool,
 };
 
 pub fn freeCommit(gpa: Allocator, commit: Commit) void {
@@ -407,6 +456,8 @@ fn commitFromC(gpa: Allocator, commit: *c.git_commit) Error!Commit {
         .author_name = name,
         .author_email = email,
         .author_time = author.*.when.time,
+        .commit_time = c.git_commit_time(commit),
+        .has_body = if (std.mem.indexOfScalar(u8, message, '\n')) |nl| std.mem.trim(u8, message[nl..], " \t\r\n").len > 0 else false,
     };
 }
 
@@ -466,9 +517,18 @@ fn dirTreeOf(self: *const Repo, commit: *c.git_commit, norm: [:0]const u8) Error
     };
 }
 
-/// For each entry of the directory at `dir_path` in `oid` ("" for the root), finds the most recent commit
-/// reachable by first parents that changed it, in tree order. Root commits count as touching everything.
+/// For each entry of the directory at `dir_path` in `oid` ("" for the root), finds the commit that last
+/// changed it as `git log -1 -- <entry>` reports it, in tree order. Root commits count as adding everything.
 /// Free the result with `freePathCommits`. Errors: `PathNotFound`, `NotDir`.
+const Queued = struct {
+    oid: Oid,
+    time: i64,
+
+    fn newerFirst(_: void, x: Queued, y: Queued) std.math.Order {
+        return std.math.order(y.time, x.time);
+    }
+};
+
 pub fn lastCommits(self: *const Repo, gpa: Allocator, io: Io, oid: Oid, dir_path: []const u8) Error![]PathCommit {
     _ = io;
     const norm = try normalizePath(gpa, dir_path);
@@ -490,47 +550,69 @@ pub fn lastCommits(self: *const Repo, gpa: Allocator, io: Io, oid: Oid, dir_path
         name.* = try a.dupeSentinel(u8, std.mem.span(c.git_tree_entry_name(item)), 0);
     }
 
-    const start_oid = try oidToC(oid);
-    var walk: ?*c.git_revwalk = null;
-    try check(c.git_revwalk_new(&walk, self.handle), error.GitFailure);
-    defer c.git_revwalk_free(walk);
-    try check(c.git_revwalk_simplify_first_parent(walk), error.GitFailure);
-    try check(c.git_revwalk_push(walk, &start_oid), error.ObjectNotFound);
+    // Each entry follows git's default history simplification, as `git log -1 -- <path>` and GitHub
+    // do: through a commit to its first parent holding the same entry, else that commit changed it.
+    // Entries travel together, so one pass over the shared history serves them all.
+    var pending: std.AutoHashMapUnmanaged(Oid, std.ArrayList(u32)) = .empty;
+    var queue: std.PriorityQueue(Queued, void, Queued.newerFirst) = .empty;
+    {
+        var all: std.ArrayList(u32) = try .initCapacity(a, count);
+        for (0..count) |idx| all.appendAssumeCapacity(@intCast(idx));
+        try pending.put(a, oid, all);
+        try queue.push(a, .{ .oid = oid, .time = 0 });
+    }
 
-    var remaining = count;
-    var id: c.git_oid = undefined;
-    while (remaining > 0) {
-        const rc = c.git_revwalk_next(&id, walk);
-        if (rc == c.GIT_ITEROVER) break;
-        try check(rc, error.GitFailure);
-
+    while (queue.pop()) |item| {
+        const kv = pending.fetchRemove(item.oid) orelse continue;
+        const paths = kv.value.items;
+        const id = try oidToC(item.oid);
         const commit = try self.lookupCommit(&id);
         defer c.git_commit_free(commit);
-        const cur = try self.dirTreeOf(commit, norm) orelse continue;
+        const cur = try self.dirTreeOf(commit, norm) orelse {
+            for (paths) |idx| found[idx] = id;
+            continue;
+        };
         defer c.git_tree_free(cur);
 
-        var prev: ?*c.git_tree = null;
-        defer if (prev) |p| c.git_tree_free(p);
-        if (c.git_commit_parentcount(commit) > 0) {
+        const nparents = c.git_commit_parentcount(commit);
+        const parents = try a.alloc(Oid, nparents);
+        const trees = try a.alloc(?*c.git_tree, nparents);
+        @memset(trees, null);
+        defer for (trees) |t| if (t) |tree| c.git_tree_free(tree);
+        for (parents, trees, 0..) |*po, *pt, n| {
             var parent: ?*c.git_commit = null;
-            try check(c.git_commit_parent(&parent, commit, 0), error.ObjectNotFound);
+            try check(c.git_commit_parent(&parent, commit, @intCast(n)), error.ObjectNotFound);
             defer c.git_commit_free(parent);
-            prev = try self.dirTreeOf(parent.?, norm);
+            po.* = oidFromC(c.git_commit_id(parent));
+            pt.* = try self.dirTreeOf(parent.?, norm);
         }
-        if (prev) |p| if (c.git_oid_equal(c.git_tree_id(p), c.git_tree_id(cur)) != 0) continue;
 
-        for (names, found) |name, *slot| {
-            if (slot.* != null) continue;
-            const now = c.git_tree_entry_byname(cur, name) orelse continue;
-            const touched = blk: {
-                const p = prev orelse break :blk true;
-                const before = c.git_tree_entry_byname(p, name) orelse break :blk true;
-                if (c.git_tree_entry_filemode_raw(now) != c.git_tree_entry_filemode_raw(before)) break :blk true;
-                break :blk c.git_oid_equal(c.git_tree_entry_id(now), c.git_tree_entry_id(before)) == 0;
+        for (paths) |idx| {
+            const now = c.git_tree_entry_byname(cur, names[idx]) orelse {
+                found[idx] = id;
+                continue;
             };
-            if (!touched) continue;
-            slot.* = id;
-            remaining -= 1;
+            const same = for (trees, 0..) |pt, n| {
+                const tree = pt orelse continue;
+                // An identical directory means every entry is unchanged against this parent.
+                if (c.git_oid_equal(c.git_tree_id(tree), c.git_tree_id(cur)) != 0) break n;
+                const before = c.git_tree_entry_byname(tree, names[idx]) orelse continue;
+                if (c.git_tree_entry_filemode_raw(now) == c.git_tree_entry_filemode_raw(before) and
+                    c.git_oid_equal(c.git_tree_entry_id(now), c.git_tree_entry_id(before)) != 0) break n;
+            } else null;
+            const n = same orelse {
+                found[idx] = id;
+                continue;
+            };
+            const gop = try pending.getOrPut(a, parents[n]);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .empty;
+                var pid = try oidToC(parents[n]);
+                const pc = try self.lookupCommit(&pid);
+                defer c.git_commit_free(pc);
+                try queue.push(a, .{ .oid = parents[n], .time = c.git_commit_time(pc) });
+            }
+            try gop.value_ptr.append(a, idx);
         }
     }
 
@@ -1102,7 +1184,7 @@ fn expectLastCommitsMatchGit(f: *Fixture, repo: *const Repo, head: Oid, dir: []c
         try testing.expectEqualStrings(name, got[i].name);
         const full = try std.fs.path.join(gpa, &.{ dir, name });
         defer gpa.free(full);
-        const want = try f.git(&.{ "log", "-1", "--first-parent", "--format=%H", "HEAD", "--", full });
+        const want = try f.git(&.{ "log", "-1", "--format=%H", "HEAD", "--", full });
         defer gpa.free(want);
         try expectOid(try Oid.parseHex(std.mem.trim(u8, want, "\n")), got[i].commit.oid);
     }
@@ -1166,21 +1248,51 @@ test "commitInfo and commitCount agree with git" {
     const author_commit = try repo.commitInfo(gpa, io, try f.rev(f.repo_path, "HEAD^"));
     defer freeCommit(gpa, author_commit);
     try testing.expectEqualStrings("headline here", author_commit.summary);
+    try testing.expect(author_commit.has_body);
     try testing.expectEqualStrings("Ada L\xc3\xb6velace", author_commit.author_name);
     try testing.expectEqualStrings("ada@example.org", author_commit.author_email);
     try expectOid(try f.rev(f.repo_path, "HEAD^"), author_commit.oid);
     const at = try f.git(&.{ "log", "-1", "--format=%at", "HEAD^" });
     defer gpa.free(at);
     try testing.expectEqual(try std.fmt.parseInt(i64, std.mem.trim(u8, at, "\n"), 10), author_commit.author_time);
+    const ct = try f.git(&.{ "log", "-1", "--format=%ct", "HEAD^" });
+    defer gpa.free(ct);
+    try testing.expectEqual(try std.fmt.parseInt(i64, std.mem.trim(u8, ct, "\n"), 10), author_commit.commit_time);
 
     const merge = try repo.commitInfo(gpa, io, try f.rev(f.repo_path, "HEAD"));
     defer freeCommit(gpa, merge);
     try testing.expectEqualStrings("merge side", merge.summary);
+    try testing.expect(!merge.has_body);
     try testing.expectEqualStrings("Test", merge.author_name);
     try testing.expectEqualStrings("test@example.com", merge.author_email);
 
     const missing = try Oid.parseHex("0123456789012345678901234567890123456789");
     try testing.expectError(error.ObjectNotFound, repo.commitInfo(gpa, io, missing));
+}
+
+test "remoteTip and newestByAuthor find the pushed commit to ask the forge about" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var f = try setupFixture(gpa, io);
+    defer f.deinit();
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "repo/extra.txt", .data = "x\n" });
+    try f.gitDiscard(&.{ "add", "-A" });
+    try f.gitDiscard(&.{ "-c", "user.email=Ada@Example.org", "commit", "-q", "-m", "local only" });
+
+    var repo = try Repo.discover(gpa, io, f.repo_path);
+    defer repo.deinit(gpa);
+
+    // The fixture's origin/main sits one commit behind the loose revision.
+    const tip = (try repo.remoteTip(gpa, io, null, "main")).?;
+    try expectOid(try f.rev(f.repo_path, "origin/main"), tip);
+    // No origin/HEAD in a repository that was never cloned.
+    try testing.expect(try repo.remoteTip(gpa, io, "origin", "no-such-branch") == null);
+    try testing.expect(try repo.remoteTip(gpa, io, "upstream", "main") == null);
+
+    try expectOid(tip, (try repo.newestByAuthor(gpa, io, tip, "TEST@example.com", 10)).?);
+    const head = try f.rev(f.repo_path, "HEAD");
+    try expectOid(head, (try repo.newestByAuthor(gpa, io, head, "ada@example.org", 10)).?);
+    try testing.expect(try repo.newestByAuthor(gpa, io, tip, "ada@example.org", 10) == null);
 }
 
 test "lastCommits finds the newest commit touching each entry" {
@@ -1218,7 +1330,8 @@ test "lastCommits finds the newest commit touching each entry" {
         .{ "b.txt", "touch b" },
         .{ "docs", "touch deep" },
         .{ "old.txt", "root" },
-        .{ "side.txt", "merge side" },
+        // Merges are looked through: side.txt matches the merge's second parent.
+        .{ "side.txt", "side only" },
     };
     try testing.expectEqual(want.len, root.len);
     for (want, root) |w, got| {
