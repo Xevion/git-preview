@@ -9,10 +9,9 @@ const Writer = std.Io.Writer;
 const Node = c.cmark_node;
 
 pub const Options = struct {
-    /// `.hard` mimics comment rendering (and the `/markdown` gfm API mode used for goldens).
-    soft_break: enum { newline, hard } = .newline,
-    /// README views wrap headings with permalink anchors; the `/markdown` API does not.
-    heading_anchors: bool = true,
+    /// Which GitHub surface to match. The `/markdown` API (gfm mode) renders soft breaks as `<br>`,
+    /// omits heading anchors, and marks all code `notranslate`; it exists here for the fixture goldens.
+    view: enum { readme, api } = .readme,
     /// Links to this host stay followable; every other absolute link gets `rel="nofollow"`.
     own_host: []const u8 = "github.com",
     /// Suffix that keeps footnote ids unique when several documents share a page.
@@ -84,10 +83,10 @@ const Renderer = struct {
             },
             c.CMARK_NODE_FOOTNOTE_DEFINITION => try r.footnoteDef(n),
             c.CMARK_NODE_TEXT => try r.text(literal(n)),
-            c.CMARK_NODE_SOFTBREAK => try r.out(if (r.opts.soft_break == .hard) "<br>\n" else "\n"),
+            c.CMARK_NODE_SOFTBREAK => try r.out(if (r.opts.view == .api) "<br>\n" else "\n"),
             c.CMARK_NODE_LINEBREAK => try r.out("<br>\n"),
             c.CMARK_NODE_CODE => {
-                try r.out("<code class=\"notranslate\">");
+                try r.out(r.codeOpen());
                 try r.text(literal(n));
                 try r.out("</code>");
             },
@@ -183,7 +182,7 @@ const Renderer = struct {
     fn heading(r: *Renderer, n: *Node) !void {
         const level = c.cmark_node_get_heading_level(n);
         try r.cr();
-        if (!r.opts.heading_anchors) {
+        if (r.opts.view == .api) {
             try r.print("<h{d} dir=\"auto\">", .{level});
             try r.children(n);
             try r.print("</h{d}>\n", .{level});
@@ -310,6 +309,12 @@ const Renderer = struct {
         const info = std.mem.span(c.cmark_node_get_fence_info(n));
         const lang_end = std.mem.indexOfAny(u8, info, " \t") orelse info.len;
         const lang = info[0..lang_end];
+        const code = literal(n);
+        if (r.opts.view == .readme) {
+            try r.out("<div class=\"snippet-clipboard-content notranslate position-relative overflow-auto\" data-snippet-clipboard-copy-content=\"");
+            try r.attr(std.mem.trimEnd(u8, code, "\n"));
+            try r.out("\">");
+        }
         if (lang.len > 0) {
             try r.out("<pre lang=\"");
             try r.attr(lang);
@@ -317,9 +322,13 @@ const Renderer = struct {
         } else {
             try r.out("<pre class=\"notranslate\">");
         }
-        try r.out("<code class=\"notranslate\">");
-        try r.text(literal(n));
-        try r.out("</code></pre>\n");
+        try r.out(r.codeOpen());
+        try r.text(code);
+        try r.out(if (r.opts.view == .readme) "</code></pre></div>\n" else "</code></pre>\n");
+    }
+
+    fn codeOpen(r: *Renderer) []const u8 {
+        return if (r.opts.view == .api) "<code class=\"notranslate\">" else "<code>";
     }
 
     fn isExternal(r: *Renderer, url: []const u8) bool {

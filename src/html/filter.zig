@@ -84,12 +84,15 @@ pub fn safeUrl(url: []const u8) bool {
     return false;
 }
 
-/// True for absolute http(s) URLs pointing away from `own_host`.
+/// True for absolute URLs pointing away from `own_host` and its subdomains.
 pub fn isExternal(url: []const u8, own_host: []const u8) bool {
     const scheme_end = std.mem.indexOf(u8, url, "://") orelse return false;
     const rest = url[scheme_end + 3 ..];
-    const host_end = std.mem.indexOfAny(u8, rest, "/:?#") orelse rest.len;
-    return !std.ascii.eqlIgnoreCase(rest[0..host_end], own_host);
+    const host = rest[0 .. std.mem.indexOfAny(u8, rest, "/:?#") orelse rest.len];
+    if (std.ascii.eqlIgnoreCase(host, own_host)) return false;
+    const sub = host.len > own_host.len and host[host.len - own_host.len - 1] == '.' and
+        std.ascii.eqlIgnoreCase(host[host.len - own_host.len ..], own_host);
+    return !sub;
 }
 
 /// Applies GFM's tagfilter: `<` opening a filtered tag becomes `&lt;` so the parser reads it as text.
@@ -279,7 +282,8 @@ const Filter = struct {
     /// Wraps every image outside a link in a link to itself, as GitHub does; emoji images are exempt.
     fn linkImages(f: *Filter, parent: *Node) !void {
         var cur: ?*Node = parent.first_child;
-        while (cur) |node| : (cur = node.next) {
+        while (cur) |node| {
+            cur = node.next;
             if (node.type != c.LXB_DOM_NODE_TYPE_ELEMENT) continue;
             const name = localName(node);
             if (std.mem.eql(u8, name, "a")) continue;
@@ -298,7 +302,6 @@ const Filter = struct {
             c.lxb_dom_node_insert_before(node, link);
             c.lxb_dom_node_remove(node);
             c.lxb_dom_node_insert_child(link, node);
-            cur = link;
         }
     }
 };
@@ -356,6 +359,7 @@ test "raw HTML is sanitized the way GitHub does" {
         .{ "<img src=\"x.png\" width=\"10\">", "<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"x.png\"><img src=\"x.png\" width=\"10\" style=\"max-width: 100%;\"></a>" },
         .{ "<a href=\"javascript:x\"><img src=\"b.svg\"></a>", "<a><img src=\"b.svg\" style=\"max-width: 100%;\"></a>" },
         .{ "<foo>kept</foo><!-- gone -->", "kept" },
+        .{ "<img src=\"a.png\">\n<img src=\"b.png\">", "<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"a.png\"><img src=\"a.png\" style=\"max-width: 100%;\"></a>\n<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"b.png\"><img src=\"b.png\" style=\"max-width: 100%;\"></a>" },
         .{ "<svg><path d=\"x\"/></svg><img src=x onerror=alert(1)>", "<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"x\"><img src=\"x\" style=\"max-width: 100%;\"></a>" },
     };
     for (cases) |case| {

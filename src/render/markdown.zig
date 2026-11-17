@@ -93,11 +93,30 @@ test "matches GitHub's recorded output for each fixture" {
         const golden = try normalizeGolden(gpa, golden_raw);
         defer gpa.free(golden);
 
-        const got = try toHtml(gpa, source, .{ .soft_break = .hard, .heading_anchors = false });
+        const got = try toHtml(gpa, source, .{ .view = .api });
         defer gpa.free(got);
         std.testing.expectEqualStrings(std.mem.trimEnd(u8, golden, "\n"), std.mem.trimEnd(u8, got, "\n")) catch |err| {
             std.debug.print("fixture {s} differs from GitHub\n", .{name});
             return err;
         };
     }
+}
+
+test "matches GitHub's README view for a recorded README" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    const source = try std.Io.Dir.cwd().readFileAlloc(io, "tests/readme/cmark-gfm.md", gpa, .limited(1 << 20));
+    defer gpa.free(source);
+    const page_raw = try std.Io.Dir.cwd().readFileAlloc(io, "tests/readme/cmark-gfm.github.html", gpa, .limited(1 << 20));
+    defer gpa.free(page_raw);
+
+    const open = "itemprop=\"text\">";
+    const body_start = std.mem.indexOf(u8, page_raw, open).? + open.len;
+    const body_end = std.mem.lastIndexOf(u8, page_raw, "</article>").?;
+    const golden = try normalizeGolden(gpa, page_raw[body_start..body_end]);
+    defer gpa.free(golden);
+
+    const got = try toHtml(gpa, source, .{});
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings(std.mem.trim(u8, golden, "\n"), std.mem.trim(u8, got, "\n"));
 }
