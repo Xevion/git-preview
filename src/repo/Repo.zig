@@ -1,9 +1,9 @@
-//! Read-only view of a git repository, parsed straight from `.git` with no subprocesses.
+//! Read-only view of a git repository, backed by libgit2 (built without TLS or SSH, never writes).
 //!
-//! Supported: SHA-1 object format, loose and packed objects, loose and packed refs,
-//! linked worktrees (`commondir`), submodule-style `gitdir:` files, bare repositories.
-//! Not supported: SHA-256 repositories, reftable ref storage, alternates, pack index v1,
-//! config `include` directives, and revision syntax beyond names and hex ids (`~`, `^`, `@{}`).
+//! Supported: loose and packed objects, alternates, linked worktrees, bare repositories,
+//! SHA-1 and (unless built with `-Dsha256=false`) SHA-256 repositories, `~`/`^`/`^{}` revision syntax,
+//! and system, global and repository config including `url.<base>.insteadOf`.
+//! Not supported: reftable ref storage (`UnsupportedRefStorage`) and lazy fetching of partial-clone objects.
 
 const Repo = @This();
 
@@ -11,13 +11,70 @@ const std = @import("std");
 const Io = std.Io;
 const Dir = Io.Dir;
 const Allocator = std.mem.Allocator;
-const odb = @import("odb.zig");
-const config = @import("config.zig");
-const object = @import("object.zig");
-const refs = @import("refs.zig");
+const c = @import("git2");
 
-pub const Oid = odb.Oid;
-pub const EntryKind = object.EntryKind;
+const log = std.log.scoped(.git);
+
+/// Whether libgit2 was built with SHA-256 object ids (`git_oid` carries a type tag).
+const wide_oids = @hasField(c.git_oid, "type");
+
+pub const Error = error{
+    NotARepository,
+    UnsafeRepository,
+    UnsupportedObjectFormat,
+    UnsupportedRefStorage,
+    UnsupportedRepository,
+    RevisionNotFound,
+    AmbiguousRevision,
+    ObjectNotFound,
+    NotACommit,
+    PathNotFound,
+    IsDir,
+    NotDir,
+    IsSubmodule,
+    CorruptObject,
+    InvalidOid,
+    GitFailure,
+    OutOfMemory,
+};
+
+/// An object id of 20 (SHA-1) or 32 (SHA-256) bytes.
+pub const Oid = struct {
+    bytes: [max_len]u8 = @splat(0),
+    len: u8,
+
+    pub const max_len = 32;
+    pub const max_hex_len = 64;
+
+    pub fn parseHex(text: []const u8) error{InvalidOid}!Oid {
+        if (text.len != 40 and text.len != 64) return error.InvalidOid;
+        var oid: Oid = .{ .len = @intCast(text.len / 2) };
+        _ = std.fmt.hexToBytes(oid.bytes[0..oid.len], text) catch return error.InvalidOid;
+        return oid;
+    }
+
+    pub fn slice(self: *const Oid) []const u8 {
+        return self.bytes[0..self.len];
+    }
+
+    /// Writes the lowercase hex form into `buf` and returns the used part.
+    pub fn hex(self: *const Oid, buf: *[max_hex_len]u8) []const u8 {
+        const out = buf[0 .. @as(usize, self.len) * 2];
+        _ = std.fmt.bufPrint(out, "{x}", .{self.slice()}) catch unreachable;
+        return out;
+    }
+
+    pub fn eql(a: Oid, b: Oid) bool {
+        return a.len == b.len and std.mem.eql(u8, a.slice(), b.slice());
+    }
+
+    pub fn format(self: Oid, w: *Io.Writer) Io.Writer.Error!void {
+        var buf: [max_hex_len]u8 = undefined;
+        try w.writeAll(self.hex(&buf));
+    }
+};
+
+pub const EntryKind = enum { file, executable, symlink, directory, submodule };
 
 pub const Entry = struct {
     name: []u8,
@@ -26,6 +83,7 @@ pub const Entry = struct {
     kind: EntryKind,
 };
 
+handle: *c.git_repository,
 /// Absolute path of the directory holding HEAD and per-worktree state.
 git_dir: []u8,
 /// Absolute path of the directory holding objects, shared refs and config; equals `git_dir` unless linked.
@@ -33,11 +91,8 @@ common_dir: []u8,
 /// Absolute path of the checked-out tree, or null for bare repositories.
 work_tree: ?[]u8,
 
-const max_config_len = 16 << 20;
-const max_packed_refs_len = 256 << 20;
-const max_ref_len = 4096;
-
 pub fn deinit(self: *Repo, gpa: Allocator) void {
+    c.git_repository_free(self.handle);
     gpa.free(self.git_dir);
     gpa.free(self.common_dir);
     if (self.work_tree) |w| gpa.free(w);
@@ -49,366 +104,258 @@ pub fn freeEntries(gpa: Allocator, entries: []Entry) void {
     gpa.free(entries);
 }
 
-/// Walks up from `start_path` looking for `.git` (directory or `gitdir:` file) or a bare repository.
+fn check(rc: c_int, not_found: Error) Error!void {
+    if (rc >= 0) return;
+    switch (rc) {
+        c.GIT_ENOTFOUND, c.GIT_EINVALIDSPEC => return not_found,
+        c.GIT_EAMBIGUOUS => return error.AmbiguousRevision,
+        c.GIT_EPEEL => return error.NotACommit,
+        c.GIT_EMISMATCH => return error.CorruptObject,
+        c.GIT_EOWNER => return error.UnsafeRepository,
+        else => {},
+    }
+    const err = c.git_error_last() orelse return error.GitFailure;
+    const msg = std.mem.span(err.*.message);
+    switch (err.*.klass) {
+        c.GIT_ERROR_NOMEMORY => return error.OutOfMemory,
+        c.GIT_ERROR_ODB, c.GIT_ERROR_ZLIB, c.GIT_ERROR_OBJECT, c.GIT_ERROR_TREE, c.GIT_ERROR_TAG, c.GIT_ERROR_INDEXER, c.GIT_ERROR_SHA => return error.CorruptObject,
+        else => {},
+    }
+    if (std.mem.indexOf(u8, msg, "refstorage") != null) return error.UnsupportedRefStorage;
+    if (std.mem.indexOf(u8, msg, "object format") != null) return error.UnsupportedObjectFormat;
+    if (std.mem.indexOf(u8, msg, "unsupported extension") != null) return error.UnsupportedRepository;
+    log.debug("libgit2 error {d} (class {d}): {s}", .{ rc, err.*.klass, msg });
+    return error.GitFailure;
+}
+
+fn oidFromC(oid: *const c.git_oid) Oid {
+    var out: Oid = .{ .len = 20 };
+    if (wide_oids and oid.type == c.GIT_OID_SHA256) out.len = 32;
+    @memcpy(out.bytes[0..out.len], oid.id[0..out.len]);
+    return out;
+}
+
+fn oidToC(oid: Oid) Error!c.git_oid {
+    var out: c.git_oid = undefined;
+    if (wide_oids) {
+        const kind = switch (oid.len) {
+            20 => @as(c.git_oid_t, c.GIT_OID_SHA1),
+            32 => @as(c.git_oid_t, c.GIT_OID_SHA256),
+            else => return error.InvalidOid,
+        };
+        try check(c.git_oid_fromraw(&out, &oid.bytes, kind), error.InvalidOid);
+    } else {
+        if (oid.len != 20) return error.UnsupportedObjectFormat;
+        try check(c.git_oid_fromraw(&out, &oid.bytes), error.InvalidOid);
+    }
+    return out;
+}
+
+fn stripSlash(path: []const u8) []const u8 {
+    return if (path.len > 1 and path[path.len - 1] == '/') path[0 .. path.len - 1] else path;
+}
+
+fn dupeCPath(gpa: Allocator, path: ?[*:0]const u8) Error!?[]u8 {
+    const p = path orelse return null;
+    return try gpa.dupe(u8, stripSlash(std.mem.span(p)));
+}
+
+/// Opens the repository containing `start_path` (a directory or a file), searching upward like git does.
 pub fn discover(gpa: Allocator, io: Io, start_path: []const u8) !Repo {
     const abs = try Dir.cwd().realPathFileAlloc(io, start_path, gpa);
     defer gpa.free(abs);
     const st = try Dir.cwd().statFile(io, abs, .{});
-    var cur: []const u8 = if (st.kind == .directory)
+    const dir = if (st.kind == .directory)
         abs
     else
         std.fs.path.dirname(abs) orelse return error.NotARepository;
+    const dir_z = try gpa.dupeSentinel(u8, dir, 0);
+    defer gpa.free(dir_z);
 
-    while (true) {
-        if (try probe(gpa, io, cur)) |repo| return repo;
-        cur = std.fs.path.dirname(cur) orelse return error.NotARepository;
-    }
+    // The count is never released: libgit2's global state lives for the whole process.
+    _ = c.git_libgit2_init();
+    // Reads never write, so a repository owned by another user is safe to open.
+    _ = c.git_libgit2_opts(c.GIT_OPT_SET_OWNER_VALIDATION, @as(c_int, 0));
+
+    var handle: ?*c.git_repository = null;
+    try check(c.git_repository_open_ext(&handle, dir_z, 0, null), error.NotARepository);
+    const repo = handle.?;
+    errdefer c.git_repository_free(repo);
+
+    const git_dir = (try dupeCPath(gpa, c.git_repository_path(repo))) orelse return error.GitFailure;
+    errdefer gpa.free(git_dir);
+    const common_dir = (try dupeCPath(gpa, c.git_repository_commondir(repo))) orelse try gpa.dupe(u8, git_dir);
+    errdefer gpa.free(common_dir);
+    const work_tree = try dupeCPath(gpa, c.git_repository_workdir(repo));
+    return .{ .handle = repo, .git_dir = git_dir, .common_dir = common_dir, .work_tree = work_tree };
 }
 
-fn statKind(io: Io, path: []const u8) !?Io.File.Kind {
-    const st = Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir => return null,
+fn lookupRemote(self: *const Repo, name: []const u8) Error!?*c.git_remote {
+    var remote: ?*c.git_remote = null;
+    var buf: [256]u8 = undefined;
+    const name_z = std.fmt.bufPrintSentinel(&buf, "{s}", .{name}, 0) catch return null;
+    check(c.git_remote_lookup(&remote, self.handle, name_z), error.NotARepository) catch |err| switch (err) {
+        error.NotARepository => return null,
         else => return err,
     };
-    return st.kind;
+    return remote;
 }
 
-fn isGitDir(gpa: Allocator, io: Io, path: []const u8, bare: bool) !bool {
-    const head = try std.fs.path.join(gpa, &.{ path, "HEAD" });
-    defer gpa.free(head);
-    if ((try statKind(io, head)) != .file) return false;
-    if (!bare) return true;
-    for ([_][]const u8{ "objects", "refs" }) |name| {
-        const p = try std.fs.path.join(gpa, &.{ path, name });
-        defer gpa.free(p);
-        if ((try statKind(io, p)) != .directory) return false;
-    }
-    return true;
-}
-
-fn probe(gpa: Allocator, io: Io, dir: []const u8) !?Repo {
-    const dot_git = try std.fs.path.join(gpa, &.{ dir, ".git" });
-    defer gpa.free(dot_git);
-    switch (try statKind(io, dot_git) orelse .unknown) {
-        .directory => if (try isGitDir(gpa, io, dot_git, false)) return try open(gpa, io, dot_git, dir),
-        .file => {
-            const raw = try readFileLimited(gpa, io, dot_git, max_ref_len) orelse return null;
-            defer gpa.free(raw);
-            const trimmed = std.mem.trim(u8, raw, " \t\r\n");
-            const target = std.mem.cutPrefix(u8, trimmed, "gitdir:") orelse return null;
-            const rel = std.mem.trim(u8, target, " \t");
-            const git_dir = if (std.fs.path.isAbsolute(rel))
-                try gpa.dupe(u8, rel)
-            else
-                try std.fs.path.join(gpa, &.{ dir, rel });
-            defer gpa.free(git_dir);
-            return try open(gpa, io, git_dir, dir);
-        },
-        else => {},
-    }
-    if (try isGitDir(gpa, io, dir, true)) return try open(gpa, io, dir, null);
-    return null;
-}
-
-fn canonical(gpa: Allocator, io: Io, path: []const u8) ![]u8 {
-    const real = try Dir.cwd().realPathFileAlloc(io, path, gpa);
-    defer gpa.free(real);
-    return gpa.dupe(u8, real);
-}
-
-fn open(gpa: Allocator, io: Io, git_dir_path: []const u8, work_tree: ?[]const u8) !Repo {
-    const git_dir = try canonical(gpa, io, git_dir_path);
-    errdefer gpa.free(git_dir);
-
-    const common_dir = if (try readFileIn(gpa, io, git_dir, "commondir", max_ref_len)) |raw| blk: {
-        defer gpa.free(raw);
-        const rel = std.mem.trim(u8, raw, " \t\r\n");
-        if (std.fs.path.isAbsolute(rel)) break :blk try canonical(gpa, io, rel);
-        const joined = try std.fs.path.join(gpa, &.{ git_dir, rel });
-        defer gpa.free(joined);
-        break :blk try canonical(gpa, io, joined);
-    } else try gpa.dupe(u8, git_dir);
-    errdefer gpa.free(common_dir);
-
-    const wt = if (work_tree) |w| try gpa.dupe(u8, w) else null;
-    return .{ .git_dir = git_dir, .common_dir = common_dir, .work_tree = wt };
-}
-
-fn readFileLimited(gpa: Allocator, io: Io, path: []const u8, limit: usize) !?[]u8 {
-    return Dir.cwd().readFileAlloc(io, path, gpa, .limited(limit)) catch |err| switch (err) {
-        error.FileNotFound, error.NotDir, error.IsDir => null,
-        else => err,
-    };
-}
-
-fn readFileIn(gpa: Allocator, io: Io, dir: []const u8, name: []const u8, limit: usize) !?[]u8 {
-    const path = try std.fs.path.join(gpa, &.{ dir, name });
-    defer gpa.free(path);
-    return readFileLimited(gpa, io, path, limit);
-}
-
-fn loadConfig(self: *const Repo, arena: Allocator, io: Io) ![]config.Entry {
-    const text = try readFileIn(arena, io, self.common_dir, "config", max_config_len) orelse return &.{};
-    return config.parse(arena, text);
-}
-
-fn checkFormat(self: *const Repo, gpa: Allocator, io: Io) !void {
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    for (try self.loadConfig(arena.allocator(), io)) |e| {
-        const value = e.value orelse continue;
-        if (e.is("extensions", "objectformat") and !std.ascii.eqlIgnoreCase(value, "sha1"))
-            return error.UnsupportedObjectFormat;
-        if (e.is("extensions", "refstorage") and !std.ascii.eqlIgnoreCase(value, "files"))
-            return error.UnsupportedRefStorage;
-    }
+fn soleRemote(self: *const Repo) Error!?*c.git_remote {
+    var names: c.git_strarray = .{ .strings = null, .count = 0 };
+    try check(c.git_remote_list(&names, self.handle), error.GitFailure);
+    defer c.git_strarray_dispose(&names);
+    if (names.count != 1) return null;
+    return self.lookupRemote(std.mem.span(names.strings[0]));
 }
 
 /// Returns the fetch URL of remote `name`, or of `origin` / the sole remote when `name` is null.
-pub fn remoteUrl(self: *const Repo, gpa: Allocator, io: Io, name: ?[]const u8) !?[]u8 {
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    const entries = try self.loadConfig(arena.allocator(), io);
-
-    const url = if (name) |n|
-        remoteUrlOf(entries, n) orelse return null
+/// `url.<base>.insteadOf` rules from system, global and repository config are applied.
+pub fn remoteUrl(self: *const Repo, gpa: Allocator, io: Io, name: ?[]const u8) Error!?[]u8 {
+    _ = io;
+    const remote = (if (name) |n|
+        try self.lookupRemote(n)
     else
-        remoteUrlOf(entries, "origin") orelse (soleRemoteUrl(entries) orelse return null);
-    return try applyInsteadOf(gpa, entries, url);
+        try self.lookupRemote("origin") orelse try self.soleRemote()) orelse return null;
+    defer c.git_remote_free(remote);
+    const url = c.git_remote_url(remote) orelse return null;
+    return try gpa.dupe(u8, std.mem.span(url));
 }
 
-fn remoteUrlOf(entries: []const config.Entry, name: []const u8) ?[]const u8 {
-    for (entries) |e| {
-        if (!e.is("remote", "url")) continue;
-        const sub = e.subsection orelse continue;
-        if (std.mem.eql(u8, sub, name)) return e.value;
-    }
-    return null;
+/// Resolves any revision expression (ref name, full or short id, `HEAD~2`, `v1^{commit}`) to an object id,
+/// peeling annotated tags down to the tagged object.
+pub fn resolveRev(self: *const Repo, gpa: Allocator, io: Io, rev: []const u8) Error!Oid {
+    _ = io;
+    if (std.mem.indexOfScalar(u8, rev, 0) != null) return error.RevisionNotFound;
+    const rev_z = try gpa.dupeSentinel(u8, rev, 0);
+    defer gpa.free(rev_z);
+
+    var obj: ?*c.git_object = null;
+    try check(c.git_revparse_single(&obj, self.handle, rev_z), error.RevisionNotFound);
+    defer c.git_object_free(obj);
+    if (c.git_object_type(obj) != c.GIT_OBJECT_TAG) return oidFromC(c.git_object_id(obj));
+    var target: ?*c.git_object = null;
+    try check(c.git_object_peel(&target, obj, c.GIT_OBJECT_ANY), error.RevisionNotFound);
+    defer c.git_object_free(target);
+    return oidFromC(c.git_object_id(target));
 }
 
-fn soleRemoteUrl(entries: []const config.Entry) ?[]const u8 {
-    var only: ?[]const u8 = null;
-    var url: ?[]const u8 = null;
-    for (entries) |e| {
-        if (!e.is("remote", "url")) continue;
-        const sub = e.subsection orelse continue;
-        if (only) |o| {
-            if (!std.mem.eql(u8, o, sub)) return null;
-        } else {
-            only = sub;
-            url = e.value;
-        }
-    }
-    return url;
-}
-
-fn applyInsteadOf(gpa: Allocator, entries: []const config.Entry, url: []const u8) ![]u8 {
-    var best_base: []const u8 = "";
-    var best_len: usize = 0;
-    for (entries) |e| {
-        if (!e.is("url", "insteadof")) continue;
-        const base = e.subsection orelse continue;
-        const prefix = e.value orelse continue;
-        if (prefix.len > best_len and std.mem.startsWith(u8, url, prefix)) {
-            best_base = base;
-            best_len = prefix.len;
-        }
-    }
-    if (best_len == 0) return gpa.dupe(u8, url);
-    return std.fmt.allocPrint(gpa, "{s}{s}", .{ best_base, url[best_len..] });
-}
-
-fn openOdb(self: *const Repo, gpa: Allocator, io: Io) !odb.Odb {
-    try self.checkFormat(gpa, io);
-    const path = try std.fs.path.join(gpa, &.{ self.common_dir, "objects" });
-    defer gpa.free(path);
-    const dir = try Dir.cwd().openDir(io, path, .{ .iterate = true });
-    return odb.Odb.init(gpa, io, dir);
-}
-
-const RefValue = struct {
-    oid: Oid,
-    peeled: ?Oid = null,
-};
-
-fn lookupRef(self: *const Repo, gpa: Allocator, io: Io, start: []const u8) !?RefValue {
-    var owned: ?[]u8 = null;
-    defer if (owned) |o| gpa.free(o);
-    var name = start;
-
-    var depth: u8 = 0;
-    while (depth < 8) : (depth += 1) {
-        if (!refs.isSafeName(name)) return null;
-        const base = if (refs.isPerWorktree(name)) self.git_dir else self.common_dir;
-        if (try readFileIn(gpa, io, base, name, max_ref_len)) |raw| {
-            defer gpa.free(raw);
-            const content = std.mem.trim(u8, raw, " \t\r\n");
-            if (std.mem.cutPrefix(u8, content, "ref:")) |target| {
-                const next = try gpa.dupe(u8, std.mem.trim(u8, target, " \t"));
-                if (owned) |o| gpa.free(o);
-                owned = next;
-                name = next;
-                continue;
-            }
-            if (content.len < Oid.hex_len) return error.CorruptRef;
-            return .{ .oid = Oid.parseHex(content[0..Oid.hex_len]) catch return error.CorruptRef };
-        }
-        const text = try readFileIn(gpa, io, self.common_dir, "packed-refs", max_packed_refs_len) orelse return null;
-        defer gpa.free(text);
-        const p = refs.findPacked(text, name) orelse return null;
-        return .{ .oid = p.oid, .peeled = p.peeled };
-    }
-    return error.SymrefLoop;
-}
-
-fn peel(db: *const odb.Odb, gpa: Allocator, io: Io, oid: Oid) !Oid {
-    var cur = oid;
-    for (0..32) |_| {
-        const obj = try db.read(gpa, io, cur);
-        defer obj.deinit(gpa);
-        if (obj.kind != .tag) return cur;
-        cur = try object.tagTarget(obj.data);
-    }
-    return error.CorruptObject;
-}
-
-fn isHex(s: []const u8) bool {
-    for (s) |c| if (!std.ascii.isHex(c)) return false;
-    return true;
-}
-
-const rev_rules = [_][]const u8{
-    "{s}",
-    "refs/{s}",
-    "refs/tags/{s}",
-    "refs/heads/{s}",
-    "refs/remotes/{s}",
-    "refs/remotes/{s}/HEAD",
-};
-
-/// Resolves a ref name, full or unique-prefix hex id to a commit id, peeling annotated tags.
-pub fn resolveRev(self: *const Repo, gpa: Allocator, io: Io, rev: []const u8) !Oid {
-    var db = try self.openOdb(gpa, io);
-    defer db.deinit(gpa, io);
-
-    if (rev.len == Oid.hex_len) {
-        if (Oid.parseHex(rev)) |oid| return peel(&db, gpa, io, oid) else |_| {}
-    }
-
-    if (refs.isSafeName(rev)) {
-        inline for (rev_rules, 0..) |rule, i| {
-            const usable = i != 0 or refs.isPseudoRef(rev) or std.mem.startsWith(u8, rev, "refs/");
-            if (usable) {
-                const candidate = try std.fmt.allocPrint(gpa, rule, .{rev});
-                defer gpa.free(candidate);
-                if (try self.lookupRef(gpa, io, candidate)) |v| {
-                    return v.peeled orelse try peel(&db, gpa, io, v.oid);
-                }
-            }
-        }
-    }
-
-    if (rev.len >= 4 and rev.len < Oid.hex_len and isHex(rev)) {
-        const oid = db.resolvePrefix(io, rev) catch |err| switch (err) {
-            error.ObjectNotFound => return error.RevisionNotFound,
-            else => return err,
-        };
-        return peel(&db, gpa, io, oid);
-    }
-    return error.RevisionNotFound;
-}
-
-fn rootTree(db: *const odb.Odb, gpa: Allocator, io: Io, oid: Oid) !Oid {
-    var cur = oid;
-    for (0..32) |_| {
-        const obj = try db.read(gpa, io, cur);
-        defer obj.deinit(gpa);
-        switch (obj.kind) {
-            .tree => return cur,
-            .commit => return object.commitTree(obj.data),
-            .tag => cur = try object.tagTarget(obj.data),
-            .blob => return error.NotACommit,
-        }
-    }
-    return error.CorruptObject;
-}
-
-const Found = struct { oid: Oid, mode: u32 };
-
-fn lookup(db: *const odb.Odb, gpa: Allocator, io: Io, root: Oid, path: []const u8) !Found {
-    var cur: Found = .{ .oid = root, .mode = 0o040000 };
+/// Joins the non-empty, non-"." components of `path` with single slashes.
+fn normalizePath(gpa: Allocator, path: []const u8) Error![:0]u8 {
+    if (std.mem.indexOfScalar(u8, path, 0) != null) return error.PathNotFound;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
     var parts = std.mem.tokenizeScalar(u8, path, '/');
     while (parts.next()) |part| {
         if (std.mem.eql(u8, part, ".")) continue;
-        if (object.kindOfMode(cur.mode) != .directory) return error.PathNotFound;
-        const tree = try db.read(gpa, io, cur.oid);
-        defer tree.deinit(gpa);
-        if (tree.kind != .tree) return error.CorruptObject;
-        var it: object.TreeIterator = .{ .data = tree.data };
-        cur = while (try it.next()) |item| {
-            if (std.mem.eql(u8, item.name, part)) break .{ .oid = item.oid, .mode = item.mode };
-        } else return error.PathNotFound;
+        if (out.items.len > 0) try out.append(gpa, '/');
+        try out.appendSlice(gpa, part);
     }
-    return cur;
+    return out.toOwnedSliceSentinel(gpa, 0);
+}
+
+fn rootTree(self: *const Repo, commit: Oid) Error!*c.git_tree {
+    const oid = try oidToC(commit);
+    var obj: ?*c.git_object = null;
+    try check(c.git_object_lookup(&obj, self.handle, &oid, c.GIT_OBJECT_ANY), error.ObjectNotFound);
+    defer c.git_object_free(obj);
+    var tree: ?*c.git_object = null;
+    try check(c.git_object_peel(&tree, obj, c.GIT_OBJECT_TREE), error.NotACommit);
+    return @ptrCast(tree.?);
+}
+
+fn kindOfMode(mode: u32) EntryKind {
+    return switch (mode & 0o170000) {
+        0o040000 => .directory,
+        0o160000 => .submodule,
+        0o120000 => .symlink,
+        else => if (mode & 0o111 != 0) .executable else .file,
+    };
 }
 
 /// Returns the bytes of the blob at `path` in `commit`'s tree. Symlinks yield their target text.
 /// Errors: `PathNotFound`, `IsDir` for a directory, `IsSubmodule` for a gitlink.
-pub fn readPath(self: *const Repo, gpa: Allocator, io: Io, commit: Oid, path: []const u8) ![]u8 {
-    var db = try self.openOdb(gpa, io);
-    defer db.deinit(gpa, io);
+pub fn readPath(self: *const Repo, gpa: Allocator, io: Io, commit: Oid, path: []const u8) Error![]u8 {
+    _ = io;
+    const norm = try normalizePath(gpa, path);
+    defer gpa.free(norm);
+    const tree = try self.rootTree(commit);
+    defer c.git_tree_free(tree);
+    if (norm.len == 0) return error.IsDir;
 
-    const found = try lookup(&db, gpa, io, try rootTree(&db, gpa, io, commit), path);
-    switch (object.kindOfMode(found.mode)) {
+    var entry: ?*c.git_tree_entry = null;
+    try check(c.git_tree_entry_bypath(&entry, tree, norm), error.PathNotFound);
+    defer c.git_tree_entry_free(entry);
+    switch (kindOfMode(c.git_tree_entry_filemode_raw(entry))) {
         .directory => return error.IsDir,
         .submodule => return error.IsSubmodule,
         else => {},
     }
-    const blob = try db.read(gpa, io, found.oid);
-    errdefer blob.deinit(gpa);
-    if (blob.kind != .blob) return error.CorruptObject;
-    return blob.data;
+    var blob: ?*c.git_blob = null;
+    try check(c.git_blob_lookup(&blob, self.handle, c.git_tree_entry_id(entry)), error.ObjectNotFound);
+    defer c.git_blob_free(blob);
+    const size: usize = @intCast(c.git_blob_rawsize(blob));
+    if (size == 0) return gpa.alloc(u8, 0);
+    const content: [*]const u8 = @ptrCast(c.git_blob_rawcontent(blob) orelse return error.CorruptObject);
+    return gpa.dupe(u8, content[0..size]);
 }
 
 /// Lists the entries of the directory at `dir_path` ("" for the root) in tree order.
 /// Free the result with `freeEntries`. Errors: `PathNotFound`, `NotDir`.
-pub fn listTree(self: *const Repo, gpa: Allocator, io: Io, commit: Oid, dir_path: []const u8) ![]Entry {
-    var db = try self.openOdb(gpa, io);
-    defer db.deinit(gpa, io);
+pub fn listTree(self: *const Repo, gpa: Allocator, io: Io, commit: Oid, dir_path: []const u8) Error![]Entry {
+    _ = io;
+    const norm = try normalizePath(gpa, dir_path);
+    defer gpa.free(norm);
+    const root = try self.rootTree(commit);
+    defer c.git_tree_free(root);
 
-    const found = try lookup(&db, gpa, io, try rootTree(&db, gpa, io, commit), dir_path);
-    if (object.kindOfMode(found.mode) != .directory) return error.NotDir;
-    const tree = try db.read(gpa, io, found.oid);
-    defer tree.deinit(gpa);
-    if (tree.kind != .tree) return error.CorruptObject;
+    var sub: ?*c.git_tree = null;
+    defer if (sub) |s| c.git_tree_free(s);
+    var tree = root;
+    if (norm.len > 0) {
+        var entry: ?*c.git_tree_entry = null;
+        try check(c.git_tree_entry_bypath(&entry, root, norm), error.PathNotFound);
+        defer c.git_tree_entry_free(entry);
+        if (kindOfMode(c.git_tree_entry_filemode_raw(entry)) != .directory) return error.NotDir;
+        try check(c.git_tree_lookup(&sub, self.handle, c.git_tree_entry_id(entry)), error.ObjectNotFound);
+        tree = sub.?;
+    }
 
-    var list: std.ArrayList(Entry) = .empty;
+    const count = c.git_tree_entrycount(tree);
+    var list: std.ArrayList(Entry) = try .initCapacity(gpa, count);
     errdefer {
         for (list.items) |e| gpa.free(e.name);
         list.deinit(gpa);
     }
-    var it: object.TreeIterator = .{ .data = tree.data };
-    while (try it.next()) |item| {
-        const name = try gpa.dupe(u8, item.name);
+    for (0..count) |i| {
+        const item = c.git_tree_entry_byindex(tree, i) orelse return error.CorruptObject;
+        const name = try gpa.dupe(u8, std.mem.span(c.git_tree_entry_name(item)));
         errdefer gpa.free(name);
-        try list.append(gpa, .{
+        const mode: u32 = @intCast(c.git_tree_entry_filemode_raw(item));
+        list.appendAssumeCapacity(.{
             .name = name,
-            .mode = item.mode,
-            .oid = item.oid,
-            .kind = object.kindOfMode(item.mode),
+            .mode = mode,
+            .oid = oidFromC(c.git_tree_entry_id(item)),
+            .kind = kindOfMode(mode),
         });
     }
     return list.toOwnedSlice(gpa);
 }
 
-test {
-    _ = odb;
-    _ = config;
-    _ = object;
-    _ = refs;
-}
-
 const testing = std.testing;
+
+const unreadable_config_dir = "/nonexistent-git-preview-config";
+
+/// Points every libgit2 config level at a directory that does not exist, so tests never read the real user's config.
+fn isolateConfig(global_dir: []const u8) !void {
+    _ = c.git_libgit2_init();
+    var buf: [Dir.max_path_bytes]u8 = undefined;
+    const global = try std.fmt.bufPrintSentinel(&buf, "{s}", .{global_dir}, 0);
+    for ([_]c_int{ c.GIT_CONFIG_LEVEL_PROGRAMDATA, c.GIT_CONFIG_LEVEL_SYSTEM, c.GIT_CONFIG_LEVEL_XDG }) |level| {
+        try testing.expect(c.git_libgit2_opts(c.GIT_OPT_SET_SEARCH_PATH, level, unreadable_config_dir) >= 0);
+    }
+    try testing.expect(c.git_libgit2_opts(c.GIT_OPT_SET_SEARCH_PATH, @as(c_int, c.GIT_CONFIG_LEVEL_GLOBAL), global.ptr) >= 0);
+}
 
 const Fixture = struct {
     gpa: Allocator,
@@ -459,6 +406,10 @@ const Fixture = struct {
         return Oid.parseHex(std.mem.trim(u8, out, " \r\n"));
     }
 
+    fn path(self: *Fixture, name: []const u8) ![]u8 {
+        return std.fs.path.join(self.gpa, &.{ self.root, name });
+    }
+
     fn writeRevision(self: *Fixture, i: usize) !void {
         const readme = try bigText(self.gpa, i, "readme");
         defer self.gpa.free(readme);
@@ -493,8 +444,8 @@ fn bigText(gpa: Allocator, rev: usize, tag: []const u8) ![]u8 {
     return out.toOwnedSlice(gpa);
 }
 
-/// Five packed commits (with deltas), a packed annotated tag, then one loose commit on top.
-fn setupFixture(gpa: Allocator, io: Io) !Fixture {
+fn newFixture(gpa: Allocator, io: Io) !Fixture {
+    try isolateConfig(unreadable_config_dir);
     var f: Fixture = .{ .gpa = gpa, .io = io, .tmp = testing.tmpDir(.{}), .root = undefined, .repo_path = undefined };
     errdefer f.tmp.cleanup();
 
@@ -503,7 +454,13 @@ fn setupFixture(gpa: Allocator, io: Io) !Fixture {
     f.root = try gpa.dupe(u8, real);
     errdefer gpa.free(f.root);
     f.repo_path = try std.fs.path.join(gpa, &.{ f.root, "repo" });
-    errdefer gpa.free(f.repo_path);
+    return f;
+}
+
+/// Five packed commits (with deltas), a packed annotated tag, then one loose commit on top.
+fn setupFixture(gpa: Allocator, io: Io) !Fixture {
+    var f = try newFixture(gpa, io);
+    errdefer f.deinit();
 
     try f.tmp.dir.createDirPath(io, "repo/docs/guide");
     try f.tmp.dir.createDirPath(io, "repo/src");
@@ -530,7 +487,9 @@ fn setupFixture(gpa: Allocator, io: Io) !Fixture {
 }
 
 fn expectOid(expected: Oid, actual: Oid) !void {
-    try testing.expectEqualStrings(&expected.toHex(), &actual.toHex());
+    var a: [Oid.max_hex_len]u8 = undefined;
+    var b: [Oid.max_hex_len]u8 = undefined;
+    try testing.expectEqualStrings(expected.hex(&a), actual.hex(&b));
 }
 
 test "fixture contains deltas" {
@@ -575,23 +534,31 @@ test "resolveRev agrees with git" {
         .{ .rev = "refs/tags/v1.0", .git_rev = "v1.0^{commit}" },
         .{ .rev = "light", .git_rev = "light" },
         .{ .rev = "origin/main", .git_rev = "origin/main" },
+        .{ .rev = "HEAD~1", .git_rev = "HEAD~1" },
+        .{ .rev = "HEAD^", .git_rev = "HEAD^" },
+        .{ .rev = "main~3", .git_rev = "main~3" },
+        .{ .rev = "feature^^", .git_rev = "feature^^" },
+        .{ .rev = "v1.0~1", .git_rev = "v1.0~1" },
+        .{ .rev = "HEAD^{tree}", .git_rev = "HEAD^{tree}" },
     };
-    for (cases) |c| {
-        const want = try f.rev(f.repo_path, c.git_rev);
-        try expectOid(want, try repo.resolveRev(gpa, io, c.rev));
+    for (cases) |c_| {
+        const want = try f.rev(f.repo_path, c_.git_rev);
+        try expectOid(want, try repo.resolveRev(gpa, io, c_.rev));
     }
 
     const tag_object = try f.rev(f.repo_path, "v1.0");
     const commit = try f.rev(f.repo_path, "v1.0^{commit}");
     try testing.expect(!tag_object.eql(commit));
-    try expectOid(commit, try repo.resolveRev(gpa, io, &tag_object.toHex()));
+    var tag_buf: [Oid.max_hex_len]u8 = undefined;
+    try expectOid(commit, try repo.resolveRev(gpa, io, tag_object.hex(&tag_buf)));
 
     for ([_][]const u8{ "HEAD", "HEAD~1", "feature", "v1.0^{commit}" }) |name| {
         const want = try f.rev(f.repo_path, name);
-        const full = want.toHex();
-        try expectOid(want, try repo.resolveRev(gpa, io, &full));
+        var buf: [Oid.max_hex_len]u8 = undefined;
+        const full = want.hex(&buf);
+        try expectOid(want, try repo.resolveRev(gpa, io, full));
         try expectOid(want, try repo.resolveRev(gpa, io, full[0..10]));
-        const short = try f.run(f.repo_path, &.{ "rev-parse", "--short=7", &full });
+        const short = try f.run(f.repo_path, &.{ "rev-parse", "--short=7", full });
         defer gpa.free(short);
         try expectOid(want, try repo.resolveRev(gpa, io, std.mem.trim(u8, short, "\n")));
     }
@@ -600,6 +567,7 @@ test "resolveRev agrees with git" {
     try testing.expectError(error.RevisionNotFound, repo.resolveRev(gpa, io, "0000000"));
     try testing.expectError(error.RevisionNotFound, repo.resolveRev(gpa, io, "../config"));
     try testing.expectError(error.RevisionNotFound, repo.resolveRev(gpa, io, "config"));
+    try testing.expectError(error.RevisionNotFound, repo.resolveRev(gpa, io, "HEAD~99"));
 }
 
 test "readPath and listTree agree with git across packed and loose objects" {
@@ -610,9 +578,9 @@ test "readPath and listTree agree with git across packed and loose objects" {
     var repo = try Repo.discover(gpa, io, f.repo_path);
     defer repo.deinit(gpa);
 
-    const log = try f.git(&.{ "rev-list", "HEAD" });
-    defer gpa.free(log);
-    var commits = std.mem.tokenizeScalar(u8, log, '\n');
+    const log_out = try f.git(&.{ "rev-list", "HEAD" });
+    defer gpa.free(log_out);
+    var commits = std.mem.tokenizeScalar(u8, log_out, '\n');
     var n: usize = 0;
     while (commits.next()) |hex| : (n += 1) {
         const commit = try Oid.parseHex(hex);
@@ -686,21 +654,48 @@ test "discover from a subdirectory and read remotes" {
     try f.gitDiscard(&.{ "config", "url.git@example.com:.insteadOf", "https://example.com/" });
     try f.gitDiscard(&.{ "config", "url.ssh://short/.insteadOf", "https://example.com/me/" });
 
-    const rewritten = (try repo.remoteUrl(gpa, io, "origin")).?;
+    var again = try Repo.discover(gpa, io, sub);
+    defer again.deinit(gpa);
+    const rewritten = (try again.remoteUrl(gpa, io, "origin")).?;
     defer gpa.free(rewritten);
-    const want = try f.git(&.{ "remote", "get-url", "origin" });
-    defer gpa.free(want);
-    try testing.expectEqualStrings(std.mem.trim(u8, want, "\n"), rewritten);
+    try testing.expectEqualStrings("git@example.com:acme/widget.git", rewritten);
 
-    const fork = (try repo.remoteUrl(gpa, io, "fork")).?;
+    const fork = (try again.remoteUrl(gpa, io, "fork")).?;
     defer gpa.free(fork);
-    const want_fork = try f.git(&.{ "remote", "get-url", "fork" });
-    defer gpa.free(want_fork);
-    try testing.expectEqualStrings(std.mem.trim(u8, want_fork, "\n"), fork);
+    try testing.expectEqualStrings("ssh://short/widget.git", fork);
 
-    const default = (try repo.remoteUrl(gpa, io, null)).?;
+    const default = (try again.remoteUrl(gpa, io, null)).?;
     defer gpa.free(default);
     try testing.expectEqualStrings(rewritten, default);
+}
+
+test "global config insteadOf applies, and the real user config is not read" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var f = try setupFixture(gpa, io);
+    defer f.deinit();
+
+    var repo = try Repo.discover(gpa, io, f.repo_path);
+    defer repo.deinit(gpa);
+    const plain = (try repo.remoteUrl(gpa, io, null)).?;
+    defer gpa.free(plain);
+    try testing.expectEqualStrings("https://example.com/acme/widget.git", plain);
+
+    try f.tmp.dir.createDirPath(io, "home");
+    try f.tmp.dir.writeFile(io, .{
+        .sub_path = "home/.gitconfig",
+        .data = "[url \"git@example.com:\"]\n\tinsteadOf = https://example.com/\n",
+    });
+    const home = try f.path("home");
+    defer gpa.free(home);
+    try isolateConfig(home);
+    defer isolateConfig(unreadable_config_dir) catch {};
+
+    var with_global = try Repo.discover(gpa, io, f.repo_path);
+    defer with_global.deinit(gpa);
+    const rewritten = (try with_global.remoteUrl(gpa, io, null)).?;
+    defer gpa.free(rewritten);
+    try testing.expectEqualStrings("git@example.com:acme/widget.git", rewritten);
 }
 
 test "linked worktree and bare clone" {
@@ -710,7 +705,7 @@ test "linked worktree and bare clone" {
     defer f.deinit();
 
     try f.gitDiscard(&.{ "worktree", "add", "-q", "-b", "wtbranch", "../wt", "HEAD~1" });
-    const wt_path = try std.fs.path.join(gpa, &.{ f.root, "wt" });
+    const wt_path = try f.path("wt");
     defer gpa.free(wt_path);
     var wt = try Repo.discover(gpa, io, wt_path);
     defer wt.deinit(gpa);
@@ -721,9 +716,10 @@ test "linked worktree and bare clone" {
     try expectOid(try f.rev(wt_path, "main"), try wt.resolveRev(gpa, io, "main"));
     const wt_url = (try wt.remoteUrl(gpa, io, null)).?;
     defer gpa.free(wt_url);
+    try testing.expectEqualStrings("https://example.com/acme/widget.git", wt_url);
 
     gpa.free(try f.run(f.root, &.{ "clone", "-q", "--bare", "repo", "bare.git" }));
-    const bare_path = try std.fs.path.join(gpa, &.{ f.root, "bare.git" });
+    const bare_path = try f.path("bare.git");
     defer gpa.free(bare_path);
     var bare = try Repo.discover(gpa, io, bare_path);
     defer bare.deinit(gpa);
@@ -733,29 +729,131 @@ test "linked worktree and bare clone" {
     try expectOid(try f.rev(bare_path, "v1.0^{commit}"), try bare.resolveRev(gpa, io, "v1.0"));
     const readme = try bare.readPath(gpa, io, head, "docs/guide/intro.md");
     defer gpa.free(readme);
-    const spec = try std.fmt.allocPrint(gpa, "{s}:docs/guide/intro.md", .{head.toHex()});
+    var buf: [Oid.max_hex_len]u8 = undefined;
+    const spec = try std.fmt.allocPrint(gpa, "{s}:docs/guide/intro.md", .{head.hex(&buf)});
     defer gpa.free(spec);
     const want = try f.run(bare_path, &.{ "show", spec });
     defer gpa.free(want);
     try testing.expectEqualSlices(u8, want, readme);
 }
 
-test "sha256 repositories are rejected" {
+test "alternates supply objects the clone does not hold" {
     const gpa = testing.allocator;
     const io = testing.io;
     var f = try setupFixture(gpa, io);
     defer f.deinit();
 
-    const out = f.run(f.root, &.{ "init", "-q", "--object-format=sha256", "wide" }) catch |err| switch (err) {
+    gpa.free(try f.run(f.root, &.{ "clone", "-q", "--shared", "repo", "shared" }));
+    const shared_path = try f.path("shared");
+    defer gpa.free(shared_path);
+    const alternates = try std.fs.path.join(gpa, &.{ shared_path, ".git", "objects", "info", "alternates" });
+    defer gpa.free(alternates);
+    try Dir.cwd().access(io, alternates, .{});
+
+    var repo = try Repo.discover(gpa, io, shared_path);
+    defer repo.deinit(gpa);
+    const head = try repo.resolveRev(gpa, io, "HEAD");
+    try expectOid(try f.rev(shared_path, "HEAD"), head);
+    const got = try repo.readPath(gpa, io, head, "README.md");
+    defer gpa.free(got);
+    var buf: [Oid.max_hex_len]u8 = undefined;
+    const spec = try std.fmt.allocPrint(gpa, "{s}:README.md", .{head.hex(&buf)});
+    defer gpa.free(spec);
+    const want = try f.run(shared_path, &.{ "show", spec });
+    defer gpa.free(want);
+    try testing.expectEqualSlices(u8, want, got);
+}
+
+test "sha256 repositories" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var f = try newFixture(gpa, io);
+    defer f.deinit();
+
+    const out = f.run(f.root, &.{ "init", "-q", "--object-format=sha256", "repo" }) catch |err| switch (err) {
         error.GitFailed => return error.SkipZigTest,
         else => return err,
     };
     gpa.free(out);
-    const path = try std.fs.path.join(gpa, &.{ f.root, "wide" });
-    defer gpa.free(path);
-    var repo = try Repo.discover(gpa, io, path);
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "repo/README.md", .data = "# wide\n" });
+    try f.gitDiscard(&.{ "add", "-A" });
+    try f.gitDiscard(&.{ "commit", "-q", "-m", "wide" });
+
+    if (!wide_oids) {
+        try testing.expectError(error.UnsupportedObjectFormat, Repo.discover(gpa, io, f.repo_path));
+        return;
+    }
+    var repo = try Repo.discover(gpa, io, f.repo_path);
     defer repo.deinit(gpa);
-    try testing.expectError(error.UnsupportedObjectFormat, repo.resolveRev(gpa, io, "HEAD"));
+    const head = try repo.resolveRev(gpa, io, "HEAD");
+    try testing.expectEqual(@as(u8, 32), head.len);
+    try expectOid(try f.rev(f.repo_path, "HEAD"), head);
+    const got = try repo.readPath(gpa, io, head, "README.md");
+    defer gpa.free(got);
+    try testing.expectEqualStrings("# wide\n", got);
+    const entries = try repo.listTree(gpa, io, head, "");
+    defer freeEntries(gpa, entries);
+    try testing.expectEqual(@as(usize, 1), entries.len);
+    try testing.expectEqual(@as(u8, 32), entries[0].oid.len);
+}
+
+test "reftable repositories are reported, not misread" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var f = try newFixture(gpa, io);
+    defer f.deinit();
+
+    const out = f.run(f.root, &.{ "init", "-q", "--ref-format=reftable", "repo" }) catch |err| switch (err) {
+        error.GitFailed => return error.SkipZigTest,
+        else => return err,
+    };
+    gpa.free(out);
+    try testing.expectError(error.UnsupportedRefStorage, Repo.discover(gpa, io, f.repo_path));
+}
+
+test "an object whose content does not match its id is rejected" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var f = try newFixture(gpa, io);
+    defer f.deinit();
+
+    gpa.free(try f.run(f.root, &.{ "init", "-q", "repo" }));
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "repo/README.md", .data = "good\n" });
+    try f.gitDiscard(&.{ "add", "-A" });
+    try f.gitDiscard(&.{ "commit", "-q", "-m", "one" });
+
+    const good = try f.git(&.{ "rev-parse", "HEAD:README.md" });
+    defer gpa.free(good);
+    const good_hex = std.mem.trim(u8, good, "\n");
+    try f.tmp.dir.writeFile(io, .{ .sub_path = "evil.txt", .data = "evil\n" });
+    const evil = try f.git(&.{ "hash-object", "-w", "../evil.txt" });
+    defer gpa.free(evil);
+    const evil_hex = std.mem.trim(u8, evil, "\n");
+
+    const good_path = try std.fmt.allocPrint(gpa, "repo/.git/objects/{s}/{s}", .{ good_hex[0..2], good_hex[2..] });
+    defer gpa.free(good_path);
+    const evil_path = try std.fmt.allocPrint(gpa, "repo/.git/objects/{s}/{s}", .{ evil_hex[0..2], evil_hex[2..] });
+    defer gpa.free(evil_path);
+    const evil_bytes = try f.tmp.dir.readFileAlloc(io, evil_path, gpa, .limited(1 << 20));
+    defer gpa.free(evil_bytes);
+    try f.tmp.dir.deleteFile(io, good_path);
+    try f.tmp.dir.writeFile(io, .{ .sub_path = good_path, .data = evil_bytes });
+
+    var repo = try Repo.discover(gpa, io, f.repo_path);
+    defer repo.deinit(gpa);
+    const head = try repo.resolveRev(gpa, io, "HEAD");
+    try testing.expectError(error.CorruptObject, repo.readPath(gpa, io, head, "README.md"));
+}
+
+test "discover disables owner validation" {
+    var f = try newFixture(testing.allocator, testing.io);
+    defer f.deinit();
+    testing.allocator.free(try f.run(f.root, &.{ "init", "-q", "repo" }));
+    var repo = try Repo.discover(testing.allocator, testing.io, f.repo_path);
+    defer repo.deinit(testing.allocator);
+    var enabled: c_int = -1;
+    try testing.expect(c.git_libgit2_opts(c.GIT_OPT_GET_OWNER_VALIDATION, &enabled) >= 0);
+    try testing.expectEqual(@as(c_int, 0), enabled);
 }
 
 test "discover fails outside a repository" {

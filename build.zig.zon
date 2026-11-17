@@ -52,6 +52,10 @@
             .url = "https://github.com/lexbor/lexbor/archive/refs/tags/v3.0.0.tar.gz",
             .hash = "N-V-__8AAMxVvAIalChC2bXMLXbWpURCkFNzlDy86Nwguncd",
         },
+        .libgit2 = .{
+            .url = "https://github.com/libgit2/libgit2/archive/refs/tags/v1.9.7.tar.gz",
+            .hash = "N-V-__8AAPE7NgGzXiYp17A2YYEYpVRbRzgNqovmU-BWmr8z",
+        },
     },
     .paths = .{
         "build.zig",
