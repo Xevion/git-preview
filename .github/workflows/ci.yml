@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: jdx/mise-action@v5.2.9
+        with:
+          cache: true
+      - uses: actions/cache@v6.1.0
+        with:
+          path: zig-pkg
+          key: zig-pkg-${{ hashFiles('build.zig.zon') }}
+      - run: zig fmt --check build.zig src
+      - run: zig build check
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: jdx/mise-action@v5.2.9
+        with:
+          cache: true
+      - uses: actions/cache@v6.1.0
+        with:
+          path: zig-pkg
+          key: zig-pkg-${{ hashFiles('build.zig.zon') }}
+      - run: zig build test --summary failures
