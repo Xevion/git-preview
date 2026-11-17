@@ -227,7 +227,7 @@ test "fills the skeleton regions of a repo page template" {
     defer page.deinit();
 
     const oid = try Repo.Oid.parseHex("0123456789abcdef0123456789abcdef01234567");
-    const commit: Repo.Commit = .{ .oid = oid, .summary = @constCast("fix: a <b>"), .author_name = @constCast("Ann"), .author_email = @constCast("a@x"), .author_time = 1000 };
+    const commit: Repo.Commit = .{ .oid = oid, .summary = @constCast("fix: a <b>"), .author_name = @constCast("Ann"), .author_email = @constCast("a@x"), .author_time = 1000, .commit_time = 1000, .has_body = false };
     try fill(arena, &page, .{
         .repo_path = "o/r",
         .ref = "dev",
