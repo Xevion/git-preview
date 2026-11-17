@@ -7,6 +7,8 @@ const page = @import("page.zig");
 const source_mod = @import("source.zig");
 const Source = source_mod.Source;
 const Resolver = @import("urls.zig").Resolver;
+const Fetcher = @import("net/Fetcher.zig");
+const template = @import("chrome/template.zig");
 
 const params = clap.parseParamsComptime(
     \\-h, --help            Show this help and exit.
@@ -16,6 +18,8 @@ const params = clap.parseParamsComptime(
     \\    --remote <str>    Remote whose host decides the forge (default: origin, else the only remote).
     \\    --forge <str>     Override forge detection: github, forgejo, gitlab.
     \\    --open            Open the page in the default browser.
+    \\    --readme-only     Write only the rendered README instead of the full repository page.
+    \\    --offline         Never use the network; render from cached pages and data only.
     \\<str>                 File to render (default: the README the forge would show).
     \\
 );
@@ -83,8 +87,14 @@ fn run(
     stderr: *std.Io.Writer,
 ) !void {
     const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", arena);
-    const file_abs: ?[]const u8 = if (file_arg) |f| try std.fs.path.resolveAlloc(arena, &.{ cwd, f }) else null;
-    const start = if (file_abs) |f| std.fs.path.dirname(f) orelse cwd else cwd;
+    const arg_abs: ?[]const u8 = if (file_arg) |f| try std.fs.path.resolveAlloc(arena, &.{ cwd, f }) else null;
+    // A directory argument names the repository to preview rather than a file in it.
+    const arg_is_dir = if (arg_abs) |a| blk: {
+        const st = std.Io.Dir.cwd().statFile(io, a, .{}) catch break :blk false;
+        break :blk st.kind == .directory;
+    } else false;
+    const file_abs: ?[]const u8 = if (arg_is_dir) null else arg_abs;
+    const start = if (arg_is_dir) arg_abs.? else if (file_abs) |f| std.fs.path.dirname(f) orelse cwd else cwd;
 
     var repo = Repo.discover(arena, io, start) catch |err| switch (err) {
         error.FileNotFound => try Repo.discover(arena, io, cwd),
@@ -139,12 +149,23 @@ fn run(
 
     const repo_name = if (remote) |r| r.name() else std.fs.path.basename(repo.work_tree orelse repo.git_dir);
     const title = try std.fmt.allocPrint(arena, "{s}/{s}", .{ repo_name, doc_path });
-    var out: std.Io.Writer.Allocating = .init(arena);
-    try page.write(&out.writer, title, fragment);
+    var fetcher: Fetcher = .init(arena, io, env, args.offline != 0);
+    defer fetcher.deinit();
+    const full_page = args.@"readme-only" == 0 and file_abs == null and kind == .github and remote != null;
+    const html = blk: {
+        if (full_page) {
+            if (repoPage(arena, &fetcher, remote.?, fragment)) |p| break :blk p else |err| {
+                try stderr.print("git-preview: repository page unavailable ({s}), writing the README alone\n", .{@errorName(err)});
+            }
+        }
+        var out: std.Io.Writer.Allocating = .init(arena);
+        try page.write(&out.writer, title, fragment);
+        break :blk out.written();
+    };
 
     const out_path = args.output orelse try defaultOutputPath(arena, env, repo_name, doc_path);
     if (std.fs.path.dirname(out_path)) |dir| try std.Io.Dir.cwd().createDirPath(io, dir);
-    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = out.written() });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = html });
 
     var stdout_buf: [512]u8 = undefined;
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buf);
@@ -152,6 +173,16 @@ fn run(
     try stdout_writer.interface.flush();
 
     if (args.open != 0) try openInBrowser(io, out_path);
+}
+
+/// The repo home page from github.com with our README swapped into its README box.
+fn repoPage(arena: std.mem.Allocator, fetcher: *Fetcher, remote: forge.Remote, readme: []const u8) ![]u8 {
+    const url = try std.fmt.allocPrint(arena, "https://{s}/{s}", .{ remote.host, remote.path });
+    var tpl = try template.load(arena, fetcher, url);
+    defer tpl.deinit();
+    const article = template.readmeArticle(&tpl) orelse return error.TemplateWithoutReadme;
+    try tpl.setInnerHtml(article, "gp-readme", readme);
+    return tpl.serialize(arena);
 }
 
 /// Forge URL prefix for repo files at the rendered commit; relative links point there.
@@ -200,5 +231,6 @@ test {
     _ = @import("forge.zig");
     _ = @import("source.zig");
     _ = @import("urls.zig");
+    _ = @import("chrome/template.zig");
     _ = @import("highlight/highlight.zig");
 }
