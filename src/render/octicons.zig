@@ -8,6 +8,10 @@ pub const light_bulb = body("light-bulb");
 pub const report = body("report");
 pub const alert = body("alert");
 pub const stop = body("stop");
+pub const file_directory_fill = body("file-directory-fill");
+pub const file = body("file");
+pub const file_submodule = body("file-submodule");
+pub const file_symlink_file = body("file-symlink-file");
 
 /// The SVG's inner markup, with self-closing elements expanded the way GitHub serializes them.
 fn body(comptime name: []const u8) []const u8 {

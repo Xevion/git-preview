@@ -5,6 +5,7 @@ const std = @import("std");
 const c = @import("lexbor");
 const dom = @import("../html/dom.zig");
 const Fetcher = @import("../net/Fetcher.zig");
+const Classes = @import("Classes.zig");
 const Node = dom.Node;
 const Element = dom.Element;
 const log = std.log.scoped(.chrome);
@@ -19,10 +20,21 @@ pub const Page = struct {
     doc: *c.lxb_html_document_t,
     /// Raw HTML spliced in at serialization, keyed by the marker comment's text.
     splices: std.StringArrayHashMapUnmanaged([]const u8) = .empty,
+    /// The inlined stylesheets, kept alive because `classes` points into them.
+    css: std.ArrayList([]u8) = .empty,
+    classes: Classes = .{},
 
     pub fn deinit(self: *Page) void {
         _ = c.lxb_html_document_destroy(self.doc);
         self.splices.deinit(self.gpa);
+        self.classes.deinit(self.gpa);
+        for (self.css.items) |s| self.gpa.free(s);
+        self.css.deinit(self.gpa);
+    }
+
+    /// A hashed class from its stem, falling back to `fallback` (stable utility classes) when unresolvable.
+    pub fn class(self: *const Page, stem: []const u8, fallback: []const u8) []const u8 {
+        return self.classes.resolve(stem) orelse fallback;
     }
 
     pub fn root(self: *Page) *Node {
@@ -34,6 +46,14 @@ pub const Page = struct {
         while (@as(?*Node, target.first_child)) |child| dom.remove(child);
         const marker = c.lxb_dom_document_create_comment(&self.doc.*.dom_document, key.ptr, key.len) orelse return error.OutOfMemory;
         c.lxb_dom_node_insert_child(target, @ptrCast(marker));
+        try self.splices.put(self.gpa, key, html);
+    }
+
+    /// Replaces `target` itself with `html`, which is trusted and inserted verbatim.
+    pub fn replaceWith(self: *Page, target: *Node, key: []const u8, html: []const u8) !void {
+        const marker = c.lxb_dom_document_create_comment(&self.doc.*.dom_document, key.ptr, key.len) orelse return error.OutOfMemory;
+        c.lxb_dom_node_insert_before(target, @ptrCast(marker));
+        dom.remove(target);
         try self.splices.put(self.gpa, key, html);
     }
 
@@ -67,15 +87,20 @@ pub fn load(gpa: std.mem.Allocator, fetcher: *Fetcher, url: []const u8) !Page {
     const res = try fetcher.get(.{ .url = url, .ttl = page_ttl, .accept = "text/html" });
     if (res.status.class() != .success) return error.TemplateUnavailable;
     defer gpa.free(res.body);
+    return parse(gpa, fetcher, res.body);
+}
 
+/// Prepares already-fetched page HTML; `fetcher` supplies its stylesheets.
+pub fn parse(gpa: std.mem.Allocator, fetcher: *Fetcher, html: []const u8) !Page {
     const doc = c.lxb_html_document_create() orelse return error.OutOfMemory;
     errdefer _ = c.lxb_html_document_destroy(doc);
-    if (c.lxb_html_document_parse(doc, res.body.ptr, res.body.len) != c.LXB_STATUS_OK) return error.HtmlParse;
+    if (c.lxb_html_document_parse(doc, html.ptr, html.len) != c.LXB_STATUS_OK) return error.HtmlParse;
 
     var page: Page = .{ .gpa = gpa, .doc = doc };
-    var prep: Prep = .{ .gpa = gpa, .fetcher = fetcher, .doc = doc };
+    var prep: Prep = .{ .gpa = gpa, .fetcher = fetcher, .doc = doc, .page = &page };
     defer prep.seen.deinit(gpa);
     try dom.eachElement(page.root(), &prep, Prep.visit);
+    for (page.css.items) |css| try page.classes.index(gpa, css);
     return page;
 }
 
@@ -83,6 +108,7 @@ const Prep = struct {
     gpa: std.mem.Allocator,
     fetcher: *Fetcher,
     doc: *c.lxb_html_document_t,
+    page: *Page,
     seen: std.StringHashMapUnmanaged(void) = .empty,
 
     fn visit(self: *Prep, node: *Node) anyerror!void {
@@ -114,8 +140,8 @@ const Prep = struct {
             log.warn("stylesheet {s} unavailable: {s}", .{ owned_href, @errorName(err) });
             return dom.remove(node);
         };
-        defer self.gpa.free(res.body);
         if (res.status.class() != .success) return dom.remove(node);
+        try self.page.css.append(self.gpa, res.body);
 
         const style: *Node = @ptrCast(c.lxb_dom_document_create_element(&self.doc.*.dom_document, "style", 5, null) orelse return error.OutOfMemory);
         if (dom.getAttr(el, "media")) |m| dom.setAttr(@ptrCast(style), "media", m);

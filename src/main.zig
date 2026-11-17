@@ -9,6 +9,7 @@ const Source = source_mod.Source;
 const Resolver = @import("urls.zig").Resolver;
 const Fetcher = @import("net/Fetcher.zig");
 const template = @import("chrome/template.zig");
+const home = @import("chrome/home.zig");
 
 const params = clap.parseParamsComptime(
     \\-h, --help            Show this help and exit.
@@ -154,7 +155,7 @@ fn run(
     const full_page = args.@"readme-only" == 0 and file_abs == null and kind == .github and remote != null;
     const html = blk: {
         if (full_page) {
-            if (repoPage(arena, &fetcher, remote.?, fragment)) |p| break :blk p else |err| {
+            if (repoPage(arena, io, &fetcher, &repo, args.rev, head_oid, remote.?, fragment)) |p| break :blk p else |err| {
                 try stderr.print("git-preview: repository page unavailable ({s}), writing the README alone\n", .{@errorName(err)});
             }
         }
@@ -176,13 +177,36 @@ fn run(
 }
 
 /// The repo home page from github.com with our README swapped into its README box.
-fn repoPage(arena: std.mem.Allocator, fetcher: *Fetcher, remote: forge.Remote, readme: []const u8) ![]u8 {
+fn repoPage(arena: std.mem.Allocator, io: std.Io, fetcher: *Fetcher, repo: *const Repo, rev: ?[]const u8, head: ?Repo.Oid, remote: forge.Remote, readme: []const u8) ![]u8 {
     const url = try std.fmt.allocPrint(arena, "https://{s}/{s}", .{ remote.host, remote.path });
     var tpl = try template.load(arena, fetcher, url);
     defer tpl.deinit();
     const article = template.readmeArticle(&tpl) orelse return error.TemplateWithoutReadme;
     try tpl.setInnerHtml(article, "gp-readme", readme);
+    if (head) |oid| try home.fill(arena, &tpl, try homeData(arena, io, repo, rev, oid, remote));
     return tpl.serialize(arena);
+}
+
+fn homeData(arena: std.mem.Allocator, io: std.Io, repo: *const Repo, rev: ?[]const u8, oid: Repo.Oid, remote: forge.Remote) !home.Data {
+    var hex: [Repo.Oid.max_hex_len]u8 = undefined;
+    const ref = rev orelse try repo.headBranch(arena, io) orelse try arena.dupe(u8, oid.hex(&hex)[0..7]);
+    const tree = try repo.listTree(arena, io, oid, "");
+    const commits = try repo.lastCommits(arena, io, oid, "");
+    const entries = try arena.alloc(home.Entry, tree.len);
+    for (tree, entries) |t, *e| {
+        const found = for (commits) |pc| {
+            if (std.mem.eql(u8, pc.name, t.name)) break pc.commit;
+        } else return error.MissingLastCommit;
+        e.* = .{ .name = t.name, .kind = t.kind, .commit = found };
+    }
+    return .{
+        .repo_path = remote.path,
+        .ref = ref,
+        .commit_count = try repo.commitCount(arena, io, oid),
+        .head = try repo.commitInfo(arena, io, oid),
+        .entries = entries,
+        .now = std.Io.Clock.real.now(io).toSeconds(),
+    };
 }
 
 /// Forge URL prefix for repo files at the rendered commit; relative links point there.
@@ -232,5 +256,8 @@ test {
     _ = @import("source.zig");
     _ = @import("urls.zig");
     _ = @import("chrome/template.zig");
+    _ = @import("chrome/home.zig");
+    _ = @import("chrome/time.zig");
+    _ = @import("chrome/Classes.zig");
     _ = @import("highlight/highlight.zig");
 }
